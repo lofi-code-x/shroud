@@ -489,12 +489,15 @@ name = "shroud-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "bytes",
  "serde",
  "serde_yaml",
  "shroud-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -516,6 +519,8 @@ name = "shroud-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "bytes",
  "serde",
  "serde_yaml",
  "shroud-core",

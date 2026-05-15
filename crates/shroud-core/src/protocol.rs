@@ -1,5 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 16;
@@ -123,6 +124,10 @@ pub enum ProtocolError {
     VersionMismatch { got: u8, expected: u8 },
     #[error("payload length mismatch: expected={expected}, got={got}")]
     PayloadLengthMismatch { expected: usize, got: usize },
+    #[error("invalid connect payload: {0}")]
+    InvalidConnectPayload(&'static str),
+    #[error("domain is too long for protocol: {0} bytes")]
+    DomainTooLong(usize),
 }
 
 impl fmt::Display for FrameType {
@@ -138,6 +143,96 @@ impl fmt::Display for FrameType {
             Self::ErrorFrame => write!(f, "ERROR"),
         }
     }
+}
+
+pub fn encode_tcp_connect_payload(host: &str, port: u16) -> Result<Bytes, ProtocolError> {
+    let mut payload = BytesMut::new();
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(addr) => {
+                payload.put_u8(AddressType::Ipv4 as u8);
+                payload.extend_from_slice(&addr.octets());
+            }
+            IpAddr::V6(addr) => {
+                payload.put_u8(AddressType::Ipv6 as u8);
+                payload.extend_from_slice(&addr.octets());
+            }
+        }
+    } else {
+        let host_bytes = host.as_bytes();
+        if host_bytes.len() > u8::MAX as usize {
+            return Err(ProtocolError::DomainTooLong(host_bytes.len()));
+        }
+
+        payload.put_u8(AddressType::Domain as u8);
+        payload.put_u8(host_bytes.len() as u8);
+        payload.extend_from_slice(host_bytes);
+    }
+
+    payload.put_u16(port);
+    Ok(payload.freeze())
+}
+
+pub fn decode_tcp_connect_payload(payload: &[u8]) -> Result<(String, u16), ProtocolError> {
+    if payload.len() < 3 {
+        return Err(ProtocolError::InvalidConnectPayload("payload too short"));
+    }
+
+    let addr_type = AddressType::try_from(payload[0])?;
+    let mut cursor = 1usize;
+
+    let host = match addr_type {
+        AddressType::Ipv4 => {
+            if payload.len() < cursor + 4 + 2 {
+                return Err(ProtocolError::InvalidConnectPayload(
+                    "ipv4 payload shorter than expected",
+                ));
+            }
+            let mut raw = [0u8; 4];
+            raw.copy_from_slice(&payload[cursor..cursor + 4]);
+            cursor += 4;
+            IpAddr::V4(Ipv4Addr::from(raw)).to_string()
+        }
+        AddressType::Ipv6 => {
+            if payload.len() < cursor + 16 + 2 {
+                return Err(ProtocolError::InvalidConnectPayload(
+                    "ipv6 payload shorter than expected",
+                ));
+            }
+            let mut raw = [0u8; 16];
+            raw.copy_from_slice(&payload[cursor..cursor + 16]);
+            cursor += 16;
+            IpAddr::V6(Ipv6Addr::from(raw)).to_string()
+        }
+        AddressType::Domain => {
+            let domain_len = *payload
+                .get(cursor)
+                .ok_or(ProtocolError::InvalidConnectPayload(
+                    "missing domain length",
+                ))? as usize;
+            cursor += 1;
+            if payload.len() < cursor + domain_len + 2 {
+                return Err(ProtocolError::InvalidConnectPayload(
+                    "domain payload shorter than expected",
+                ));
+            }
+            let domain_raw = &payload[cursor..cursor + domain_len];
+            cursor += domain_len;
+            std::str::from_utf8(domain_raw)
+                .map_err(|_| ProtocolError::InvalidConnectPayload("domain is not valid utf-8"))?
+                .to_string()
+        }
+    };
+
+    if payload.len() != cursor + 2 {
+        return Err(ProtocolError::InvalidConnectPayload(
+            "payload has unexpected trailing bytes",
+        ));
+    }
+
+    let port = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
+    Ok((host, port))
 }
 
 #[cfg(test)]
@@ -161,5 +256,21 @@ mod tests {
         assert_eq!(decoded.stream_id, 42);
         assert_eq!(decoded.flags, 1);
         assert_eq!(decoded.payload, Bytes::from_static(b"hello"));
+    }
+
+    #[test]
+    fn roundtrip_connect_payload_domain() {
+        let payload = encode_tcp_connect_payload("example.com", 443).expect("encode");
+        let (host, port) = decode_tcp_connect_payload(payload.as_ref()).expect("decode");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn roundtrip_connect_payload_ipv4() {
+        let payload = encode_tcp_connect_payload("127.0.0.1", 8080).expect("encode");
+        let (host, port) = decode_tcp_connect_payload(payload.as_ref()).expect("decode");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8080);
     }
 }

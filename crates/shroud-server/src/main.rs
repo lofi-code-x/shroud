@@ -8,11 +8,12 @@ use std::fs;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+// cargo run -p shroud-server -- configs/server.yaml
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let config_path = std::env::args()
         .nth(1)
