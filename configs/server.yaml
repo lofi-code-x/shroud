@@ -1,0 +1,6 @@
+listen: "0.0.0.0:8443"
+tunnel_path: "/api/tunnel"
+web_root: "./web"
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "replace-with-random-secret"

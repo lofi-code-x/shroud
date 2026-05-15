@@ -1,0 +1,20 @@
+inbound:
+  listen: "127.0.0.1:1080"
+
+outbound:
+  server: "your-domain.com"
+  port: 443
+  path: "/api/tunnel"
+  tls: true
+
+auth:
+  client_id: "11111111-1111-1111-1111-111111111111"
+  client_secret: "replace-with-random-secret"
+
+routing:
+  default: "proxy"
+  rules:
+    - action: "direct"
+      domain_suffix: ".local"
+    - action: "direct"
+      port: 22

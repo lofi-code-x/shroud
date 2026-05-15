@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/shroud-core",
+    "crates/shroud-client",
+    "crates/shroud-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+bytes = "1.10"
+hmac = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
