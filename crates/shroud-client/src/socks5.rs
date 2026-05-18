@@ -7,7 +7,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info};
 
-//Эта функция запускает асинхронный TCP-сервер и обрабатывает каждое соединение параллельно.
 pub async fn serve(listen: SocketAddr, router: Router, tunnel: TunnelClient) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     info!(%listen, "SOCKS5 inbound listener started");
@@ -27,34 +26,20 @@ pub async fn serve(listen: SocketAddr, router: Router, tunnel: TunnelClient) -> 
     }
 }
 
-//Эта функция handle_connection обрабатывает одного входящего TCP-клиента,
-// вероятно в формате SOCKS-подобного CONNECT-потока, решает, как маршрутизировать соединение,
-// и отправляет клиенту ответ об успехе или ошибке.
-
 async fn handle_connection(
     mut socket: TcpStream,
     peer: SocketAddr,
     router: Router,
     tunnel: TunnelClient,
 ) -> Result<()> {
-    //Выполняется настройка протокола:
     handshake(&mut socket).await?;
-    //Выполняется настройка протокола:
     let request = read_connect_request(&mut socket).await?;
-
-    //Из запроса извлекается информация о целевом адресе:
     let target_host = request.host.as_str();
     let target_port = request.port;
-
-    //Функция спрашивает у роутера, что делать с этим соединением:
-
-    //Важный момент: _stream будет сброшен в конце этой ветки match, поэтому сейчас код только проверяет возможность подключения.
-    // Он не продолжает пересылать трафик между клиентом и целевым сервером.
     let action = router.decide(target_host, target_port);
 
     match action {
         RouteAction::Proxy => {
-            dbg!(&target_host, &target_port);
             let mut upstream = match tunnel
                 .connect_target_via_tunnel(target_host, target_port)
                 .await

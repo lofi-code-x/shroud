@@ -164,6 +164,7 @@ impl TunnelClient {
 
         let response = read_http_headers(&mut stream).await?;
         let status = parse_status_code(&response).context("failed to parse tunnel response")?;
+
         if status != 101 {
             bail!("tunnel endpoint rejected upgrade with HTTP status {status}");
         }

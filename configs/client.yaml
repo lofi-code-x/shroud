@@ -2,8 +2,8 @@ inbound:
   listen: "127.0.0.1:1080"
 
 outbound:
-  server: "your-domain.com"
-  port: 443
+  server: "127.0.0.1"
+  port: 8443
   path: "/api/tunnel"
   tls: true
 
