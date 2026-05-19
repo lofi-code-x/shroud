@@ -447,7 +447,8 @@ fn build_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path).with_context(|| format!("failed to open certificate file {path}"))?;
+    let file =
+        File::open(path).with_context(|| format!("failed to open certificate file {path}"))?;
     let mut reader = BufReader::new(file);
     rustls_pemfile::certs(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()

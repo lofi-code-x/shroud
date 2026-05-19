@@ -660,6 +660,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "shroud-core",
+ "shroud-server",
  "tokio",
  "tokio-rustls",
  "tracing",

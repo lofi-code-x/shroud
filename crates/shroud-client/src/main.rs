@@ -1,8 +1,5 @@
-mod routing;
-mod socks5;
-mod tunnel;
-
 use anyhow::{Context, Result};
+use shroud_client::{routing, socks5, tunnel};
 use shroud_core::config::ClientConfig;
 use std::fs;
 use tracing::info;

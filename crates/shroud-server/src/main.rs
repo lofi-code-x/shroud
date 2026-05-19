@@ -1,9 +1,6 @@
-mod auth;
-mod relay;
-mod web;
-
 use anyhow::{Context, Result};
 use shroud_core::config::ServerConfig;
+use shroud_server::web;
 use std::fs;
 use tracing::info;
 use tracing_subscriber::EnvFilter;

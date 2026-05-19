@@ -18,3 +18,6 @@ uuid.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 shroud-core = { path = "../shroud-core" }
+
+[dev-dependencies]
+shroud-server = { path = "../shroud-server" }
