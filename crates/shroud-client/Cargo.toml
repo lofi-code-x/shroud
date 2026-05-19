@@ -11,7 +11,10 @@ bytes.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
 shroud-core = { path = "../shroud-core" }

@@ -1,6 +1,10 @@
 listen: "0.0.0.0:8443"
 tunnel_path: "/api/tunnel"
 web_root: "./web"
+tls:
+  enabled: true
+  cert_path: "certs/localhost.crt"
+  key_path: "certs/localhost.key"
 clients:
   - client_id: "11111111-1111-1111-1111-111111111111"
     client_secret: "replace-with-random-secret"

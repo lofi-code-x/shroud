@@ -5,14 +5,26 @@ use bytes::Bytes;
 use shroud_core::auth::compute_auth_tag;
 use shroud_core::config::{ClientAuthConfig, OutboundConfig};
 use shroud_core::protocol::{Frame, FrameType, HEADER_LEN, encode_tcp_connect_payload};
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tracing::debug;
 
 const MAX_HTTP_HEADERS: usize = 16 * 1024;
 const STREAM_ID: u64 = 1;
 const CONNECT_OK_FLAG: u16 = 0x0001;
+
+pub trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> TunnelIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+pub type TunnelStream = Box<dyn TunnelIo>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RelayStats {
@@ -35,17 +47,17 @@ impl TunnelClient {
         &self,
         target_host: &str,
         target_port: u16,
-    ) -> Result<TcpStream> {
+    ) -> Result<TunnelStream> {
         self.open_tunnel(target_host, target_port).await
     }
 
     pub async fn relay_over_tunnel_stream(
         &self,
         client_socket: &mut TcpStream,
-        upstream: &mut TcpStream,
+        upstream: &mut TunnelStream,
     ) -> Result<RelayStats> {
         let (mut client_read, mut client_write) = client_socket.split();
-        let (mut upstream_read, mut upstream_write) = upstream.split();
+        let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
 
         let client_to_upstream = async {
             let mut transferred = 0u64;
@@ -118,16 +130,8 @@ impl TunnelClient {
         })
     }
 
-    async fn open_tunnel(&self, target_host: &str, target_port: u16) -> Result<TcpStream> {
-        if self.outbound.tls {
-            warn!(
-                server = %self.outbound.server,
-                port = self.outbound.port,
-                "tls outbound requested, but tls transport is not implemented yet; using plain tcp"
-            );
-        }
-
-        let mut stream = TcpStream::connect((self.outbound.server.as_str(), self.outbound.port))
+    async fn open_tunnel(&self, target_host: &str, target_port: u16) -> Result<TunnelStream> {
+        let stream = TcpStream::connect((self.outbound.server.as_str(), self.outbound.port))
             .await
             .with_context(|| {
                 format!(
@@ -135,6 +139,30 @@ impl TunnelClient {
                     self.outbound.server, self.outbound.port
                 )
             })?;
+
+        let mut stream: TunnelStream = if self.outbound.tls {
+            let connector = TlsConnector::from(Arc::new(build_tls_client_config(&self.outbound)?));
+            let server_name = self
+                .outbound
+                .tls_server_name
+                .as_deref()
+                .unwrap_or(&self.outbound.server)
+                .to_owned();
+            let server_name = ServerName::try_from(server_name)
+                .map_err(|err| anyhow!("invalid tls server name: {err}"))?;
+            let tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to establish tls connection to {}:{}",
+                        self.outbound.server, self.outbound.port
+                    )
+                })?;
+            Box::new(tls_stream)
+        } else {
+            Box::new(stream)
+        };
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -207,7 +235,35 @@ impl TunnelClient {
     }
 }
 
-async fn read_http_headers(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn build_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    if let Some(path) = &outbound.tls_ca_cert_path {
+        let certs = load_certs(path)?;
+        let (_added, ignored) = root_store.add_parsable_certificates(certs);
+        if ignored > 0 {
+            bail!("ignored {ignored} invalid certificate(s) from tls_ca_cert_path={path}");
+        }
+    }
+
+    Ok(ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth())
+}
+
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let file = File::open(path).with_context(|| format!("failed to open certificate file {path}"))?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read certificates from {path}"))
+}
+
+async fn read_http_headers<R>(stream: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
     let mut data = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
 
@@ -247,7 +303,7 @@ async fn write_frame<W>(
     payload: Bytes,
 ) -> Result<()>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + ?Sized,
 {
     let frame = Frame {
         frame_type,
@@ -261,7 +317,7 @@ where
 
 async fn read_frame<R>(reader: &mut R) -> Result<Frame>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + ?Sized,
 {
     let mut header = [0u8; HEADER_LEN];
     reader.read_exact(&mut header).await?;

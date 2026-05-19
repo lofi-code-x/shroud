@@ -8,7 +8,10 @@ use tracing::debug;
 
 const CONNECT_OK_FLAG: u16 = 0x0001;
 
-pub async fn relay_tunnel(mut tunnel_stream: TcpStream, peer: SocketAddr) -> Result<()> {
+pub async fn relay_tunnel<S>(mut tunnel_stream: S, peer: SocketAddr) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let connect_request = read_frame(&mut tunnel_stream).await?;
     if connect_request.frame_type != FrameType::TcpConnect {
         write_frame(
@@ -56,7 +59,7 @@ pub async fn relay_tunnel(mut tunnel_stream: TcpStream, peer: SocketAddr) -> Res
     )
     .await?;
 
-    let (mut tunnel_read, mut tunnel_write) = tunnel_stream.split();
+    let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel_stream);
     let (mut target_read, mut target_write) = target_stream.split();
 
     let tunnel_to_target = async {
@@ -150,7 +153,7 @@ async fn write_frame<W>(
     payload: Bytes,
 ) -> Result<()>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + ?Sized,
 {
     let frame = Frame {
         frame_type,
@@ -164,7 +167,7 @@ where
 
 async fn read_frame<R>(reader: &mut R) -> Result<Frame>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + ?Sized,
 {
     let mut header = [0u8; HEADER_LEN];
     reader.read_exact(&mut header).await?;

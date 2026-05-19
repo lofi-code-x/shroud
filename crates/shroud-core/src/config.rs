@@ -62,6 +62,10 @@ pub struct OutboundConfig {
     pub port: u16,
     pub path: String,
     pub tls: bool,
+    #[serde(default)]
+    pub tls_server_name: Option<String>,
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +117,19 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub tunnel_path: String,
     pub web_root: String,
+    #[serde(default)]
+    pub tls: ServerTlsConfig,
     pub clients: Vec<AuthorizedClient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

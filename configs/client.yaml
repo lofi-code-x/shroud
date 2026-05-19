@@ -6,6 +6,8 @@ outbound:
   port: 8443
   path: "/api/tunnel"
   tls: true
+  tls_server_name: "localhost"
+  tls_ca_cert_path: "certs/ca.crt"
 
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
