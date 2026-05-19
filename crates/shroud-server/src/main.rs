@@ -6,6 +6,8 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 // cargo run -p shroud-server -- configs/server.yaml
+// curl -i --cacert /home/laptop/Projects/shroud/certs/ca.crt https://localhost:8443/
+// curl -X POST -i --cacert /home/laptop/Projects/shroud/certs/ca.crt https://localhost:8443/api/tunnel
 
 #[tokio::main]
 async fn main() -> Result<()> {
