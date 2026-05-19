@@ -6,8 +6,12 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 // cargo run -p shroud-client -- configs/client.yaml
+
+//DNS remote resolve
 // curl --socks5-hostname 127.0.0.1:1080 https://example.com
 
+//DNS leak
+//curl -v --socks5 127.0.0.1:1080 https://example.com/
 #[tokio::main]
 async fn main() -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
@@ -22,8 +26,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to parse client yaml config: {config_path}"))?;
 
     info!(listen = %cfg.inbound.listen, "starting shroud client");
-    let router = routing::Router::new(cfg.routing.clone());
+    let router = routing::Router::try_new(cfg.routing.clone()).context("invalid routing config")?;
     let tunnel = tunnel::TunnelClient::new(cfg.outbound.clone(), cfg.auth.clone());
 
-    socks5::serve(cfg.inbound.listen, router, tunnel).await
+    socks5::serve(cfg.inbound.listen, router, tunnel, cfg.dns.clone()).await
 }

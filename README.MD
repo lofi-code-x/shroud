@@ -443,7 +443,38 @@ custom binary frames
 
 ---
 
-### 14.3. HTTP/2 stream
+### 14.3. HTTP/1.1 Upgrade over TLS
+
+```text
+HTTPS
+ ↓
+POST /api/tunnel
+ ↓
+Connection: Upgrade
+ ↓
+Upgrade: shroud-tunnel
+ ↓
+custom binary frames
+```
+
+Это текущий MVP transport в проекте.
+
+Плюсы:
+
+- проще, чем настоящий WebSocket/HTTP/2;
+- работает поверх обычного TLS listener'а;
+- рядом можно держать обычный fallback web service;
+- удобно тестировать без дополнительного WebSocket stack.
+
+Минусы:
+
+- это не стандартный WebSocket;
+- reverse proxy нужно настраивать под raw HTTP Upgrade;
+- поведение long-lived upgraded connection всё равно может отличаться от обычного сайта.
+
+---
+
+### 14.4. HTTP/2 stream
 
 ```text
 TLS
@@ -468,7 +499,7 @@ binary frames
 
 ---
 
-### 14.4. HTTP/3 / QUIC
+### 14.5. HTTP/3 / QUIC
 
 ```text
 UDP 443
@@ -502,7 +533,7 @@ custom frames
 ```text
 SOCKS5 inbound
 +
-custom protocol over WebSocket/TLS
+custom protocol over TLS + HTTP/1.1 Upgrade
 ```
 
 Для производительности:
@@ -594,6 +625,9 @@ outbounds:
 
 routing:
   rules:
+    - domain: "localhost"
+      outbound: "direct"
+
     - domain_suffix: ".local"
       outbound: "direct"
 
@@ -618,10 +652,24 @@ routing:
 ```text
 1. Клиент получает target host/IP/port.
 2. Проверяет правила сверху вниз.
-3. direct → подключается напрямую.
-4. proxy → отправляет CONNECT на сервер.
-5. block → закрывает соединение.
+3. Условия внутри одного rule объединяются через AND.
+4. Первый совпавший rule побеждает.
+5. direct → подключается напрямую.
+6. proxy → отправляет CONNECT на сервер.
+7. block → закрывает соединение.
 ```
+
+Текущая реализация:
+
+```text
+domain        — точное совпадение домена, case-insensitive, без учёта trailing dot
+domain_suffix — совпадение по суффиксу, case-insensitive, без учёта trailing dot
+cidr          — IPv4/IPv6 CIDR, только если target уже IP-адрес
+port          — порт назначения
+default       — действие, если ни одно правило не совпало
+```
+
+Пример: rule с `cidr: "10.0.0.0/8"` не сработает для `example.com`, даже если домен позже резолвится в `10.x.x.x`. CIDR применяется только к IP target, который уже пришёл из SOCKS request.
 
 ---
 
@@ -665,6 +713,32 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com
 ```bash
 curl --socks5 127.0.0.1:1080 https://example.com
 ```
+
+Текущая SOCKS-реализация поддерживает remote DNS в этом базовом виде:
+
+```text
+SOCKS client передал DOMAIN → shroud-client сохраняет домен → shroud-server резолвит target
+SOCKS client передал IPv4/IPv6 → remote DNS уже невозможен, имя было потеряно до shroud-client
+```
+
+Для явной политики есть настройки:
+
+```yaml
+dns:
+  remote_by_default: true
+  warn_on_ip_targets: true
+  block_ip_targets: false
+```
+
+Поля:
+
+```text
+remote_by_default   — документирует ожидаемое поведение SOCKS mode: домены передаются на сервер
+warn_on_ip_targets  — логировать warning, если target уже IP и remote DNS применить нельзя
+block_ip_targets    — strict mode: блокировать IP targets, чтобы замечать локальный DNS/resolution
+```
+
+Если `warn_on_ip_targets: true`, клиент пишет warning для запросов вида `CONNECT 93.184.216.34:443`. Это главный диагностический сигнал DNS leak в SOCKS mode.
 
 ---
 
@@ -881,15 +955,17 @@ relay
 Transport:
 
 ```text
-TLS + WebSocket
+TLS + HTTP/1.1 Upgrade
 ```
 
-Почему WebSocket:
+Почему HTTP/1.1 Upgrade для текущего MVP:
 
-- быстро собрать;
+- уже реализовано;
+- быстро собрать без WebSocket stack;
 - легко тестировать;
-- можно посадить за Caddy/Nginx;
-- удобно сделать fallback на обычный сайт.
+- можно держать fallback на обычный сайт на том же listener'е.
+
+WebSocket/TLS остаётся возможным следующим transport-вариантом, если понадобится лучшее соответствие стандартному web stack и reverse proxy.
 
 ---
 
@@ -907,14 +983,33 @@ direct/proxy/block
 
 ---
 
-### Этап 3 — HTTP/2 или QUIC transport
+### Этап 3 — WebSocket, HTTP/2 или QUIC transport
 
-После MVP можно заменить WebSocket на:
+После MVP можно заменить HTTP/1.1 Upgrade на:
 
 ```text
+WebSocket/TLS
+или
 HTTP/2 long-lived stream
 или
 HTTP/3/QUIC
+```
+
+```text
+Этап 3 — заменить custom HTTP/1.1 Upgrade transport
+
+3.1. Добавить WebSocket/TLS transport как основной production transport.
+     Причина: лучше совместимость с reverse proxy/CDN, более естественный HTTPS-паттерн,
+     минимальные изменения в текущем Frame protocol.
+
+3.2. Оставить HTTP/1.1 Upgrade transport как dev/debug fallback.
+     Причина: он проще для тестов и диагностики.
+
+3.3. Позже исследовать HTTP/2 transport.
+     Причина: потенциально лучше для multiplexing и flow control.
+
+3.4. QUIC/HTTP/3 рассматривать отдельно, если понадобится UDP relay,
+     мобильность соединений или снижение head-of-line blocking.
 ```
 
 ---
@@ -1009,7 +1104,12 @@ zap / zerolog
 
 ```text
 Transport:
-  TLS + WebSocket или HTTP/2
+  TLS + HTTP/1.1 Upgrade
+
+Future transport options:
+  WebSocket/TLS
+  HTTP/2
+  HTTP/3/QUIC
 
 Auth:
   client_id + HMAC challenge-response
@@ -1043,13 +1143,15 @@ DNS:
 1. App подключается к SOCKS5 127.0.0.1:1080.
 2. Client получает target: example.com:443.
 3. Routing решает: proxy.
-4. Client открывает TLS/WebSocket до your-domain.com/api/tunnel.
-5. Client проходит AUTH.
-6. Client отправляет TCP_CONNECT example.com:443.
-7. Server подключается к example.com:443.
-8. Server отвечает CONNECT_OK.
-9. Client и server гоняют DATA-фреймы.
-10. При закрытии отправляется CLOSE.
+4. Client открывает TLS-соединение до your-domain.com:443.
+5. Client отправляет HTTP/1.1 POST /api/tunnel с Connection: Upgrade.
+6. Server принимает Upgrade и переключает соединение в binary frame mode.
+7. Client проходит AUTH.
+8. Client отправляет TCP_CONNECT example.com:443.
+9. Server подключается к example.com:443.
+10. Server отвечает CONNECT_OK.
+11. Client и server гоняют DATA-фреймы.
+12. При закрытии отправляется CLOSE.
 ```
 
 ---
@@ -1087,7 +1189,7 @@ Client:
   - SOCKS5 inbound 127.0.0.1:1080
   - routing engine
   - remote DNS
-  - custom binary protocol over WebSocket/TLS
+  - custom binary protocol over TLS + HTTP/1.1 Upgrade
 
 Server:
   - HTTPS 443
@@ -1130,7 +1232,7 @@ target site
 Самая здравая первая версия:
 
 ```text
-SOCKS5 inbound → custom CONNECT protocol → WebSocket/TLS → server TCP relay
+SOCKS5 inbound → custom CONNECT protocol → TLS + HTTP/1.1 Upgrade → server TCP relay
 ```
 
 После того как это стабильно работает, можно добавлять:

@@ -2,8 +2,8 @@ use shroud_client::routing::Router;
 use shroud_client::socks5;
 use shroud_client::tunnel::TunnelClient;
 use shroud_core::config::{
-    AuthorizedClient, ClientAuthConfig, OutboundConfig, RouteAction, RoutingConfig, RoutingRule,
-    ServerConfig, ServerTlsConfig,
+    AuthorizedClient, ClientAuthConfig, ClientDnsConfig, OutboundConfig, RouteAction,
+    RoutingConfig, RoutingRule, ServerConfig, ServerTlsConfig,
 };
 use shroud_server::web;
 use std::net::SocketAddr;
@@ -142,6 +142,7 @@ async fn block_route_rejects_socks_connect() -> TestResult {
             default: RouteAction::Proxy,
             rules: vec![RoutingRule {
                 action: RouteAction::Block,
+                domain: None,
                 domain_suffix: None,
                 cidr: None,
                 port: Some(80),
@@ -154,6 +155,32 @@ async fn block_route_rejects_socks_connect() -> TestResult {
 
     let reply = socks_connect_reply_code(client.addr, "example.com", 80).await?;
     assert_eq!(reply, 0x02, "expected SOCKS connection-not-allowed reply");
+    Ok(())
+}
+
+#[tokio::test]
+async fn dns_policy_can_block_ip_targets() -> TestResult {
+    let client = start_socks_client_with_dns(
+        free_addr().await?,
+        RoutingConfig {
+            default: RouteAction::Direct,
+            rules: vec![],
+        },
+        "/api/tunnel",
+        CLIENT_SECRET,
+        ClientDnsConfig {
+            remote_by_default: true,
+            warn_on_ip_targets: true,
+            block_ip_targets: true,
+        },
+    )
+    .await?;
+
+    let reply = socks_connect_reply_code(client.addr, "127.0.0.1", 80).await?;
+    assert_eq!(
+        reply, 0x02,
+        "expected SOCKS connection-not-allowed reply for IP target blocked by DNS policy"
+    );
     Ok(())
 }
 
@@ -187,6 +214,23 @@ async fn start_socks_client(
     tunnel_path: &str,
     client_secret: &str,
 ) -> TestResult<RunningTask> {
+    start_socks_client_with_dns(
+        tunnel_addr,
+        routing,
+        tunnel_path,
+        client_secret,
+        ClientDnsConfig::default(),
+    )
+    .await
+}
+
+async fn start_socks_client_with_dns(
+    tunnel_addr: SocketAddr,
+    routing: RoutingConfig,
+    tunnel_path: &str,
+    client_secret: &str,
+    dns: ClientDnsConfig,
+) -> TestResult<RunningTask> {
     let listen = free_addr().await?;
     let router = Router::new(routing);
     let tunnel = TunnelClient::new(
@@ -195,7 +239,7 @@ async fn start_socks_client(
     );
 
     let handle = tokio::spawn(async move {
-        let _ = socks5::serve(listen, router, tunnel).await;
+        let _ = socks5::serve(listen, router, tunnel, dns).await;
     });
     wait_for_tcp(listen).await?;
     Ok(RunningTask {

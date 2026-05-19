@@ -1,13 +1,18 @@
 use crate::routing::Router;
 use crate::tunnel::TunnelClient;
 use anyhow::{Context, Result, bail};
-use shroud_core::config::RouteAction;
+use shroud_core::config::{ClientDnsConfig, RouteAction};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-pub async fn serve(listen: SocketAddr, router: Router, tunnel: TunnelClient) -> Result<()> {
+pub async fn serve(
+    listen: SocketAddr,
+    router: Router,
+    tunnel: TunnelClient,
+    dns: ClientDnsConfig,
+) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     info!(%listen, "SOCKS5 inbound listener started");
 
@@ -17,9 +22,10 @@ pub async fn serve(listen: SocketAddr, router: Router, tunnel: TunnelClient) -> 
 
         let router = router.clone();
         let tunnel = tunnel.clone();
+        let dns = dns.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(socket, peer, router, tunnel).await {
+            if let Err(err) = handle_connection(socket, peer, router, tunnel, dns).await {
                 debug!(%peer, error = %err, "connection handling failed");
             }
         });
@@ -206,11 +212,38 @@ async fn handle_connection(
     peer: SocketAddr,
     router: Router,
     tunnel: TunnelClient,
+    dns: ClientDnsConfig,
 ) -> Result<()> {
     handshake(&mut socket).await?;
     let request = read_connect_request(&mut socket).await?;
     let target_host = request.host.as_str();
     let target_port = request.port;
+    if let Some(target_ip) = target_host.parse::<IpAddr>().ok() {
+        if dns.warn_on_ip_targets {
+            warn!(
+                %peer,
+                %target_ip,
+                target_port,
+                remote_by_default = dns.remote_by_default,
+                block_ip_targets = dns.block_ip_targets,
+                "SOCKS target is an IP address; remote DNS cannot be applied because the application likely resolved the name locally"
+            );
+        }
+
+        if dns.block_ip_targets {
+            write_reply(&mut socket, ReplyCode::ConnectionNotAllowed).await?;
+            debug!(%peer, target_host, target_port, "blocked IP target by DNS policy");
+            return Ok(());
+        }
+    } else if dns.remote_by_default {
+        debug!(
+            %peer,
+            target_host,
+            target_port,
+            "SOCKS target is a domain; preserving it for remote resolution"
+        );
+    }
+
     let action = router.decide(target_host, target_port);
 
     match action {

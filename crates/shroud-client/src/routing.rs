@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use shroud_core::config::{RouteAction, RoutingConfig, RoutingRule};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -9,6 +10,11 @@ pub struct Router {
 impl Router {
     pub fn new(config: RoutingConfig) -> Self {
         Self { config }
+    }
+
+    pub fn try_new(config: RoutingConfig) -> Result<Self> {
+        validate_config(&config)?;
+        Ok(Self::new(config))
     }
 
     pub fn decide(&self, target_host: &str, target_port: u16) -> RouteAction {
@@ -27,8 +33,14 @@ fn apply_rule(rule: &RoutingRule, target_host: &str, target_port: u16) -> Option
         }
     }
 
+    if let Some(domain) = &rule.domain {
+        if !domain_matches(domain, target_host) {
+            return None;
+        }
+    }
+
     if let Some(suffix) = &rule.domain_suffix {
-        if !target_host.ends_with(suffix) {
+        if !domain_suffix_matches(suffix, target_host) {
             return None;
         }
     }
@@ -40,6 +52,39 @@ fn apply_rule(rule: &RoutingRule, target_host: &str, target_port: u16) -> Option
     }
 
     Some(rule.action)
+}
+
+fn validate_config(config: &RoutingConfig) -> Result<()> {
+    for (index, rule) in config.rules.iter().enumerate() {
+        if let Some(cidr) = &rule.cidr {
+            let Some((network, prefix_len)) = parse_cidr(cidr) else {
+                bail!("routing.rules[{index}].cidr is not valid CIDR: {cidr}");
+            };
+            match network {
+                IpAddr::V4(_) if prefix_len > 32 => {
+                    bail!("routing.rules[{index}].cidr has invalid IPv4 prefix: {cidr}")
+                }
+                IpAddr::V6(_) if prefix_len > 128 => {
+                    bail!("routing.rules[{index}].cidr has invalid IPv6 prefix: {cidr}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn domain_matches(domain: &str, target_host: &str) -> bool {
+    normalize_domain(domain) == normalize_domain(target_host)
+}
+
+fn domain_suffix_matches(suffix: &str, target_host: &str) -> bool {
+    normalize_domain(target_host).ends_with(&normalize_domain(suffix))
+}
+
+fn normalize_domain(value: &str) -> String {
+    value.trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn cidr_matches(cidr: &str, target_host: &str) -> bool {
@@ -96,12 +141,14 @@ mod tests {
 
     fn rule(
         action: RouteAction,
+        domain: Option<&str>,
         domain_suffix: Option<&str>,
         cidr: Option<&str>,
         port: Option<u16>,
     ) -> RoutingRule {
         RoutingRule {
             action,
+            domain: domain.map(str::to_string),
             domain_suffix: domain_suffix.map(str::to_string),
             cidr: cidr.map(str::to_string),
             port,
@@ -112,7 +159,7 @@ mod tests {
     fn uses_default_when_no_rules_match() {
         let router = router(
             RouteAction::Proxy,
-            vec![rule(RouteAction::Direct, Some(".local"), None, None)],
+            vec![rule(RouteAction::Direct, None, Some(".local"), None, None)],
         );
 
         assert!(matches!(
@@ -125,7 +172,7 @@ mod tests {
     fn matches_domain_suffix_rule() {
         let router = router(
             RouteAction::Proxy,
-            vec![rule(RouteAction::Direct, Some(".local"), None, None)],
+            vec![rule(RouteAction::Direct, None, Some(".local"), None, None)],
         );
 
         assert!(matches!(
@@ -135,10 +182,46 @@ mod tests {
     }
 
     #[test]
+    fn matches_domain_suffix_case_insensitively_without_trailing_dot() {
+        let router = router(
+            RouteAction::Proxy,
+            vec![rule(RouteAction::Direct, None, Some(".LOCAL."), None, None)],
+        );
+
+        assert!(matches!(
+            router.decide("Printer.Local.", 443),
+            RouteAction::Direct
+        ));
+    }
+
+    #[test]
+    fn matches_exact_domain_rule_case_insensitively_without_trailing_dot() {
+        let router = router(
+            RouteAction::Proxy,
+            vec![rule(
+                RouteAction::Direct,
+                Some("Example.COM."),
+                None,
+                None,
+                None,
+            )],
+        );
+
+        assert!(matches!(
+            router.decide("example.com", 443),
+            RouteAction::Direct
+        ));
+        assert!(matches!(
+            router.decide("api.example.com", 443),
+            RouteAction::Proxy
+        ));
+    }
+
+    #[test]
     fn matches_port_rule() {
         let router = router(
             RouteAction::Proxy,
-            vec![rule(RouteAction::Direct, None, None, Some(22))],
+            vec![rule(RouteAction::Direct, None, None, None, Some(22))],
         );
 
         assert!(matches!(
@@ -155,7 +238,13 @@ mod tests {
     fn matches_ipv4_cidr_rule() {
         let router = router(
             RouteAction::Proxy,
-            vec![rule(RouteAction::Direct, None, Some("10.0.0.0/8"), None)],
+            vec![rule(
+                RouteAction::Direct,
+                None,
+                None,
+                Some("10.0.0.0/8"),
+                None,
+            )],
         );
 
         assert!(matches!(
@@ -172,7 +261,13 @@ mod tests {
     fn matches_ipv6_cidr_rule() {
         let router = router(
             RouteAction::Proxy,
-            vec![rule(RouteAction::Block, None, Some("2001:db8::/32"), None)],
+            vec![rule(
+                RouteAction::Block,
+                None,
+                None,
+                Some("2001:db8::/32"),
+                None,
+            )],
         );
 
         assert!(matches!(
@@ -189,7 +284,13 @@ mod tests {
     fn cidr_rule_does_not_match_domain_target() {
         let router = router(
             RouteAction::Proxy,
-            vec![rule(RouteAction::Direct, None, Some("10.0.0.0/8"), None)],
+            vec![rule(
+                RouteAction::Direct,
+                None,
+                None,
+                Some("10.0.0.0/8"),
+                None,
+            )],
         );
 
         assert!(matches!(
@@ -202,7 +303,13 @@ mod tests {
     fn invalid_cidr_rule_does_not_match() {
         let router = router(
             RouteAction::Proxy,
-            vec![rule(RouteAction::Direct, None, Some("10.0.0.0/99"), None)],
+            vec![rule(
+                RouteAction::Direct,
+                None,
+                None,
+                Some("10.0.0.0/99"),
+                None,
+            )],
         );
 
         assert!(matches!(
@@ -217,6 +324,7 @@ mod tests {
             RouteAction::Proxy,
             vec![rule(
                 RouteAction::Direct,
+                None,
                 None,
                 Some("192.168.0.0/16"),
                 Some(8080),
@@ -238,8 +346,8 @@ mod tests {
         let router = router(
             RouteAction::Proxy,
             vec![
-                rule(RouteAction::Block, None, Some("10.0.0.0/8"), None),
-                rule(RouteAction::Direct, None, Some("10.20.0.0/16"), None),
+                rule(RouteAction::Block, None, None, Some("10.0.0.0/8"), None),
+                rule(RouteAction::Direct, None, None, Some("10.20.0.0/16"), None),
             ],
         );
 
@@ -247,5 +355,21 @@ mod tests {
             router.decide("10.20.30.40", 443),
             RouteAction::Block
         ));
+    }
+
+    #[test]
+    fn try_new_rejects_invalid_cidr() {
+        let config = RoutingConfig {
+            default: RouteAction::Proxy,
+            rules: vec![rule(
+                RouteAction::Direct,
+                None,
+                None,
+                Some("10.0.0.0/99"),
+                None,
+            )],
+        };
+
+        assert!(Router::try_new(config).is_err());
     }
 }
