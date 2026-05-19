@@ -6,11 +6,13 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use shroud_core::config::{ServerConfig, ServerTlsConfig};
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::BufReader;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -18,10 +20,14 @@ use tracing::{debug, info};
 
 const MAX_HTTP_HEADERS: usize = 16 * 1024;
 const ALLOWED_TIMESTAMP_SKEW_SECS: i64 = 120;
+const NONCE_LEN: usize = 16;
+const NONCE_HEADER_LEN: usize = 22;
+const NONCE_CACHE_TTL_SECS: u64 = (ALLOWED_TIMESTAMP_SKEW_SECS as u64) * 2;
 
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     let tls_acceptor = build_tls_acceptor(&cfg.tls)?;
+    let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(NONCE_CACHE_TTL_SECS)));
     info!(
         listen = %cfg.listen,
         tls = cfg.tls.enabled,
@@ -32,15 +38,16 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         let cfg = cfg.clone();
         let tls_acceptor = tls_acceptor.clone();
+        let nonce_cache = nonce_cache.clone();
 
         tokio::spawn(async move {
             let result = if let Some(acceptor) = tls_acceptor {
                 match acceptor.accept(stream).await {
-                    Ok(stream) => handle_connection(stream, peer, cfg).await,
+                    Ok(stream) => handle_connection(stream, peer, cfg, nonce_cache).await,
                     Err(err) => Err(anyhow!(err)).context("tls handshake failed"),
                 }
             } else {
-                handle_connection(stream, peer, cfg).await
+                handle_connection(stream, peer, cfg, nonce_cache).await
             };
 
             if let Err(err) = result {
@@ -54,6 +61,7 @@ async fn handle_connection<S>(
     mut stream: S,
     peer: std::net::SocketAddr,
     cfg: ServerConfig,
+    nonce_cache: Arc<NonceCache>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -89,15 +97,20 @@ where
         bail!("timestamp outside allowed skew window");
     }
 
-    let nonce = STANDARD_NO_PAD
-        .decode(nonce_raw)
-        .context("invalid base64 nonce in x-shroud-nonce")?;
+    let nonce = decode_nonce(nonce_raw)?;
 
     if !validate_auth(&cfg.clients, client_id, &nonce, timestamp, auth_tag) {
         stream
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
             .await?;
         bail!("auth validation failed for client_id={client_id}");
+    }
+
+    if !nonce_cache.insert_unique(client_id, &nonce).await {
+        stream
+            .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        bail!("replayed nonce for client_id={client_id}");
     }
 
     stream
@@ -107,6 +120,78 @@ where
         .await?;
     relay_tunnel(stream, peer).await?;
     Ok(())
+}
+
+fn decode_nonce(nonce_raw: &str) -> Result<Vec<u8>> {
+    if nonce_raw.len() != NONCE_HEADER_LEN {
+        bail!("invalid x-shroud-nonce length");
+    }
+
+    if !nonce_raw
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+    {
+        bail!("invalid x-shroud-nonce format");
+    }
+
+    let nonce = STANDARD_NO_PAD
+        .decode(nonce_raw)
+        .context("invalid base64 nonce in x-shroud-nonce")?;
+    if nonce.len() != NONCE_LEN {
+        bail!("invalid x-shroud-nonce decoded length");
+    }
+
+    Ok(nonce)
+}
+
+#[derive(Clone, Eq)]
+struct NonceKey {
+    client_id: String,
+    nonce: Vec<u8>,
+}
+
+impl PartialEq for NonceKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_id == other.client_id && self.nonce == other.nonce
+    }
+}
+
+impl Hash for NonceKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.client_id.hash(state);
+        self.nonce.hash(state);
+    }
+}
+
+struct NonceCache {
+    ttl: Duration,
+    entries: Mutex<HashMap<NonceKey, Instant>>,
+}
+
+impl NonceCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn insert_unique(&self, client_id: &str, nonce: &[u8]) -> bool {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().await;
+        entries.retain(|_key, expires_at| *expires_at > now);
+
+        let key = NonceKey {
+            client_id: client_id.to_string(),
+            nonce: nonce.to_vec(),
+        };
+        if entries.contains_key(&key) {
+            return false;
+        }
+
+        entries.insert(key, now + self.ttl);
+        true
+    }
 }
 
 fn build_tls_acceptor(tls: &ServerTlsConfig) -> Result<Option<TlsAcceptor>> {
@@ -218,4 +303,63 @@ fn required_header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Resu
         .get(name)
         .map(String::as_str)
         .ok_or_else(|| anyhow!("missing required header {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_nonce_accepts_16_byte_standard_base64_without_padding() {
+        let nonce = [7u8; NONCE_LEN];
+        let encoded = STANDARD_NO_PAD.encode(nonce);
+
+        assert_eq!(decode_nonce(&encoded).expect("decode nonce"), nonce);
+    }
+
+    #[test]
+    fn decode_nonce_rejects_padding() {
+        let nonce = [7u8; NONCE_LEN];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(nonce);
+
+        assert!(decode_nonce(&encoded).is_err());
+    }
+
+    #[test]
+    fn decode_nonce_rejects_wrong_decoded_length() {
+        let nonce = [7u8; NONCE_LEN - 1];
+        let encoded = STANDARD_NO_PAD.encode(nonce);
+
+        assert!(decode_nonce(&encoded).is_err());
+    }
+
+    #[test]
+    fn decode_nonce_rejects_non_base64_header_chars() {
+        assert!(decode_nonce("!!!!!!!!!!!!!!invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn nonce_cache_rejects_reuse_for_same_client() {
+        let cache = NonceCache::new(Duration::from_secs(60));
+
+        assert!(cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
+        assert!(!cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
+    }
+
+    #[tokio::test]
+    async fn nonce_cache_allows_same_nonce_for_different_clients() {
+        let cache = NonceCache::new(Duration::from_secs(60));
+
+        assert!(cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
+        assert!(cache.insert_unique("client-b", &[1u8; NONCE_LEN]).await);
+    }
+
+    #[tokio::test]
+    async fn nonce_cache_expires_entries() {
+        let cache = NonceCache::new(Duration::from_millis(1));
+
+        assert!(cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(cache.insert_unique("client-a", &[1u8; NONCE_LEN]).await);
+    }
 }
