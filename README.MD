@@ -1275,7 +1275,10 @@ advanced DNS
 
 ## 29. TUN implementation status
 
-Текущий код уже подготовлен к TUN mode, но полноценный VPN-like режим ещё не включён.
+Текущий код уже содержит экспериментальный TUN TCP path, но полноценный
+production-ready VPN-like режим ещё не включён. TCP/IP stack теперь не
+самописный: TUN TCP path использует `netstack-smoltcp`, который построен поверх
+`smoltcp`.
 
 Реализовано:
 
@@ -1285,26 +1288,42 @@ TUN config parsing
 Linux /dev/net/tun open + TUNSETIFF
 Linux interface setup plan: address, MTU, link up
 loop-protection route plan for IP tunnel endpoint
+bootstrap DNS resolution for domain tunnel endpoint before auto-route
+auto-route default route switch
+default route / loop-protection route cleanup on shutdown
 fake DNS mapping layer
+TUN blocking packet reader
+TUN packet pump into smoltcp-backed netstack
+fake-IP → domain restore for observed TCP packets
+netstack-smoltcp TCP listener for virtual TCP streams
+virtual TCP stream → SessionCore direct/proxy/block path
+ICMP enabled through the netstack
+```
+
+Что изменилось после перехода на готовый stack:
+
+```text
+removed hand-written SYN/ACK/payload/FIN packet state machine
+removed hand-written IPv4/TCP response packet builder
+TCP stream extraction is delegated to netstack-smoltcp/smoltcp
+not validated by a real TUN end-to-end integration test yet
 ```
 
 Пока намеренно не реализовано:
 
 ```text
-TUN packet read loop
-tun2socks-like TCP stack
 UDP relay
-automatic default route switch
 system DNS switch
-route cleanup on shutdown
 ```
 
-Почему default route пока не применяется:
+Почему `auto_route` всё ещё нужно включать осторожно:
 
 ```text
-Если заменить default route на tun0 до появления packet engine,
-системный трафик попадёт в интерфейс, но клиент ещё не сможет обработать IP-пакеты.
-Это приведёт к потере сетевого доступа.
+Если включить auto_route=true, весь системный TCP-трафик начнёт попадать в TUN.
+Клиент заранее резолвит domain tunnel endpoint, ставит route exception к IP
+endpoint'а, затем меняет default route на TUN и восстанавливает прежний default
+route при shutdown. Но DNS системы пока не переключается автоматически, а UDP
+relay ещё не реализован.
 ```
 
 Текущее безопасное поведение:
@@ -1318,9 +1337,12 @@ inbounds.tun.enabled = true
   ↓
 если auto_route=true, добавить route exception для tunnel server IP
   ↓
-не менять default route
+если auto_route=true, заменить default route на TUN
   ↓
-остановиться с явной ошибкой: TUN runtime is not implemented yet
+запустить fake DNS listener и TUN packet reader/parser
+  ↓
+при shutdown удалить TUN default route, восстановить прежний default route,
+удалить route exception
 ```
 
 Manual smoke check на Linux:
@@ -1328,6 +1350,33 @@ Manual smoke check на Linux:
 ```bash
 sudo RUST_LOG=debug cargo run -p shroud-client -- configs/client.yaml
 ```
+
+Автоматизированный TCP smoke check через Linux network namespaces:
+
+```bash
+sudo ./scripts/tun-smoke-linux.sh
+```
+
+Скрипт создаёт две временные namespace:
+
+```text
+client namespace:
+  shroud-client + TUN interface + auto_route=true
+  default route switched to TUN by the client
+  curl http://target without SOCKS
+
+server namespace:
+  shroud-server
+  HTTP target bound to a non-directly-connected test IP
+```
+
+Ожидаемый результат:
+
+```text
+PASS: curl reached 198.51.100.10:18080 through shroudsm0 and Shroud tunnel
+```
+
+Скрипт не меняет маршруты основной системы и удаляет namespaces при выходе.
 
 Для этой проверки в `configs/client.yaml` нужно временно включить:
 
@@ -1347,11 +1396,15 @@ inbounds:
 ```text
 клиент открывает TUN device,
 логирует planned route setup,
-логирует fake DNS listen address,
-затем завершается до запуска packet engine.
+запускает fake DNS listener,
+запускает TUN packet reader/parser.
 ```
 
 Для проверки loop-protection route нужно указывать `outbound.server` как IP-адрес. Если `outbound.server` — домен, route exception пока не строится, потому что DNS resolution tunnel endpoint'а ещё не вынесен в отдельный bootstrap шаг.
+
+Текущий TUN TCP path стоит считать experimental: он полезен для разработки и
+ручных smoke checks, но перед включением `auto_route` как полноценного default
+route нужен Linux namespace/root-gated end-to-end тест.
 
 ---
 

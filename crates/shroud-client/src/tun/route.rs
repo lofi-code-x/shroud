@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use shroud_core::config::{OutboundConfig, TunInboundConfig};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
@@ -57,26 +57,35 @@ pub struct RoutePlan {
     pub interface: Vec<RouteCommand>,
     pub loop_protection: Vec<RouteCommand>,
     pub default_route: Vec<RouteCommand>,
+    pub cleanup: Vec<RouteCommand>,
 }
 
 impl RoutePlan {
     pub fn build(
         tun_name: &str,
         tun: &TunInboundConfig,
-        outbound: &OutboundConfig,
         endpoint_route: Option<EndpointRoute>,
+        previous_default_routes: &[DefaultRoute],
     ) -> Result<Self> {
         validate_tun_address(&tun.address)?;
 
         let mut loop_protection = Vec::new();
+        let mut loop_protection_cleanup = Vec::new();
+        let mut cleanup = Vec::new();
         if let Some(route) = endpoint_route {
-            loop_protection.push(route_command_for_endpoint(outbound, route)?);
-        } else if outbound.server.parse::<IpAddr>().is_err() {
-            warn!(
-                server = %outbound.server,
-                "cannot build loop-protection route for domain tunnel endpoint before DNS resolution"
-            );
+            loop_protection_cleanup.push(delete_endpoint_route_command(route.endpoint));
+            loop_protection.push(route_command_for_endpoint(route));
         }
+
+        cleanup.push(RouteCommand::ip([
+            "route", "del", "default", "dev", tun_name,
+        ]));
+        cleanup.extend(
+            previous_default_routes
+                .iter()
+                .map(|route| route.restore_command()),
+        );
+        cleanup.extend(loop_protection_cleanup);
 
         Ok(Self {
             interface: vec![
@@ -95,6 +104,7 @@ impl RoutePlan {
             default_route: vec![RouteCommand::ip([
                 "route", "replace", "default", "dev", tun_name,
             ])],
+            cleanup,
         })
     }
 
@@ -123,6 +133,26 @@ impl RoutePlan {
     }
 }
 
+pub struct TunRouteGuard {
+    cleanup: Vec<RouteCommand>,
+}
+
+impl TunRouteGuard {
+    fn new(cleanup: Vec<RouteCommand>) -> Self {
+        Self { cleanup }
+    }
+}
+
+impl Drop for TunRouteGuard {
+    fn drop(&mut self) {
+        for command in &self.cleanup {
+            if let Err(err) = command.run() {
+                warn!(command = %command, error = %err, "failed to clean up TUN route command");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointRoute {
     pub endpoint: IpAddr,
@@ -130,17 +160,48 @@ pub struct EndpointRoute {
     pub dev: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultRoute {
+    tokens: Vec<String>,
+}
+
+impl DefaultRoute {
+    fn restore_command(&self) -> RouteCommand {
+        let mut args = vec!["route".to_string(), "replace".to_string()];
+        args.extend(self.tokens.clone());
+        RouteCommand::ip(args)
+    }
+}
+
 pub fn setup_interface_only(tun_name: &str, tun: &TunInboundConfig) -> Result<()> {
-    let plan = RoutePlan::build(tun_name, tun, &dummy_outbound(), None)?;
+    let plan = RoutePlan::build(tun_name, tun, None, &[])?;
     plan.apply_interface()
 }
 
-pub fn resolve_endpoint_route(outbound: &OutboundConfig) -> Result<Option<EndpointRoute>> {
-    let endpoint = match outbound.server.parse::<IpAddr>() {
-        Ok(endpoint) => endpoint,
-        Err(_) => return Ok(None),
-    };
+pub fn resolve_endpoint_ip(outbound: &OutboundConfig) -> Result<IpAddr> {
+    if let Ok(endpoint) = outbound.server.parse::<IpAddr>() {
+        return Ok(endpoint);
+    }
 
+    (outbound.server.as_str(), outbound.port)
+        .to_socket_addrs()
+        .with_context(|| {
+            format!(
+                "failed to bootstrap-resolve tunnel endpoint {}:{} before TUN auto-route",
+                outbound.server, outbound.port
+            )
+        })?
+        .next()
+        .map(|addr| addr.ip())
+        .with_context(|| {
+            format!(
+                "bootstrap DNS returned no addresses for tunnel endpoint {}:{}",
+                outbound.server, outbound.port
+            )
+        })
+}
+
+pub fn resolve_endpoint_route(endpoint: IpAddr) -> Result<Option<EndpointRoute>> {
     platform::resolve_endpoint_route(endpoint)
 }
 
@@ -148,27 +209,45 @@ pub fn setup_before_packet_engine(
     tun_name: &str,
     tun: &TunInboundConfig,
     outbound: &OutboundConfig,
-) -> Result<()> {
-    let endpoint_route = resolve_endpoint_route(outbound)?;
-    let plan = RoutePlan::build(tun_name, tun, outbound, endpoint_route)?;
+) -> Result<TunRouteGuard> {
+    let previous_default_routes = if tun.auto_route {
+        platform::default_routes().context("failed to capture existing default routes")?
+    } else {
+        Vec::new()
+    };
+    let endpoint_route = if tun.auto_route {
+        let endpoint = resolve_endpoint_ip(outbound)?;
+        Some(resolve_endpoint_route(endpoint)?.with_context(|| {
+            format!("failed to find current route to tunnel endpoint {endpoint}")
+        })?)
+    } else {
+        None
+    };
+    let plan = RoutePlan::build(tun_name, tun, endpoint_route, &previous_default_routes)?;
     plan.log();
     plan.apply_interface()
         .context("failed to configure TUN interface")?;
+    let route_guard = TunRouteGuard::new(if tun.auto_route {
+        plan.cleanup.clone()
+    } else {
+        Vec::new()
+    });
 
     if tun.auto_route {
+        if plan.loop_protection.is_empty() {
+            bail!("cannot enable TUN auto_route without tunnel endpoint loop-protection route");
+        }
         plan.apply_loop_protection()
             .context("failed to install tunnel endpoint loop-protection route")?;
+        plan.apply_default_route()
+            .context("failed to install TUN default route")?;
         info!(
             tun = tun_name,
-            "installed TUN interface setup and loop-protection routes"
-        );
-        warn!(
-            tun = tun_name,
-            "default route setup is deferred until TUN packet engine is implemented"
+            "installed TUN interface setup, loop-protection route, and default route"
         );
     }
 
-    Ok(())
+    Ok(route_guard)
 }
 
 fn run_all(commands: &[RouteCommand]) -> Result<()> {
@@ -178,17 +257,10 @@ fn run_all(commands: &[RouteCommand]) -> Result<()> {
     Ok(())
 }
 
-fn route_command_for_endpoint(
-    outbound: &OutboundConfig,
-    endpoint_route: EndpointRoute,
-) -> Result<RouteCommand> {
-    let endpoint = outbound
-        .server
-        .parse::<IpAddr>()
-        .context("loop-protection endpoint must be an IP address")?;
-    let prefix = match endpoint {
-        IpAddr::V4(_) => format!("{endpoint}/32"),
-        IpAddr::V6(_) => format!("{endpoint}/128"),
+fn route_command_for_endpoint(endpoint_route: EndpointRoute) -> RouteCommand {
+    let prefix = match endpoint_route.endpoint {
+        IpAddr::V4(endpoint) => format!("{endpoint}/32"),
+        IpAddr::V6(endpoint) => format!("{endpoint}/128"),
     };
 
     let mut args = vec!["route".to_string(), "replace".to_string(), prefix];
@@ -198,7 +270,15 @@ fn route_command_for_endpoint(
     }
     args.push("dev".to_string());
     args.push(endpoint_route.dev);
-    Ok(RouteCommand::ip(args))
+    RouteCommand::ip(args)
+}
+
+fn delete_endpoint_route_command(endpoint: IpAddr) -> RouteCommand {
+    let prefix = match endpoint {
+        IpAddr::V4(_) => format!("{endpoint}/32"),
+        IpAddr::V6(_) => format!("{endpoint}/128"),
+    };
+    RouteCommand::ip(["route".to_string(), "del".to_string(), prefix])
 }
 
 fn validate_tun_address(address: &str) -> Result<()> {
@@ -220,20 +300,9 @@ fn validate_tun_address(address: &str) -> Result<()> {
     }
 }
 
-fn dummy_outbound() -> OutboundConfig {
-    OutboundConfig {
-        server: "127.0.0.1".to_string(),
-        port: 0,
-        path: "/".to_string(),
-        tls: false,
-        tls_server_name: None,
-        tls_ca_cert_path: None,
-    }
-}
-
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::EndpointRoute;
+    use super::{DefaultRoute, EndpointRoute};
     use anyhow::{Context, Result, bail};
     use std::net::IpAddr;
     use std::process::Command;
@@ -251,6 +320,21 @@ mod platform {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         parse_ip_route_get(endpoint, &stdout)
+    }
+
+    pub fn default_routes() -> Result<Vec<DefaultRoute>> {
+        let output = Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+            .context("failed to read existing default routes")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("failed to read existing default routes: {stderr}");
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_default_routes(&stdout))
     }
 
     fn parse_ip_route_get(endpoint: IpAddr, output: &str) -> Result<Option<EndpointRoute>> {
@@ -285,6 +369,20 @@ mod platform {
         Ok(Some(EndpointRoute { endpoint, via, dev }))
     }
 
+    fn parse_default_routes(output: &str) -> Vec<DefaultRoute> {
+        output
+            .lines()
+            .filter_map(|line| {
+                let tokens: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+                if tokens.first().is_some_and(|token| token == "default") {
+                    Some(DefaultRoute { tokens })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -316,16 +414,38 @@ mod platform {
             assert!(route.via.is_none());
             assert_eq!(route.dev, "eth0");
         }
+
+        #[test]
+        fn parses_default_routes_for_restore() {
+            let routes = parse_default_routes(
+                "default via 192.168.1.1 dev wlan0 proto dhcp metric 600\n\
+                 default dev eth0 metric 700\n",
+            );
+
+            assert_eq!(routes.len(), 2);
+            assert_eq!(
+                routes[0].restore_command().to_string(),
+                "ip route replace default via 192.168.1.1 dev wlan0 proto dhcp metric 600"
+            );
+            assert_eq!(
+                routes[1].restore_command().to_string(),
+                "ip route replace default dev eth0 metric 700"
+            );
+        }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    use super::EndpointRoute;
+    use super::{DefaultRoute, EndpointRoute};
     use anyhow::{Result, bail};
     use std::net::IpAddr;
 
     pub fn resolve_endpoint_route(_endpoint: IpAddr) -> Result<Option<EndpointRoute>> {
+        bail!("TUN route setup is currently implemented only on Linux")
+    }
+
+    pub fn default_routes() -> Result<Vec<DefaultRoute>> {
         bail!("TUN route setup is currently implemented only on Linux")
     }
 }
@@ -346,21 +466,9 @@ mod tests {
         }
     }
 
-    fn outbound(server: &str) -> OutboundConfig {
-        OutboundConfig {
-            server: server.to_string(),
-            port: 443,
-            path: "/api/tunnel".to_string(),
-            tls: true,
-            tls_server_name: None,
-            tls_ca_cert_path: None,
-        }
-    }
-
     #[test]
     fn builds_interface_and_default_route_commands() {
-        let plan =
-            RoutePlan::build("tun-test0", &tun(), &outbound("example.com"), None).expect("plan");
+        let plan = RoutePlan::build("tun-test0", &tun(), None, &[]).expect("plan");
 
         assert_eq!(
             plan.interface[0].to_string(),
@@ -385,13 +493,7 @@ mod tests {
             dev: "wlan0".to_string(),
         };
 
-        let plan = RoutePlan::build(
-            "tun-test0",
-            &tun(),
-            &outbound("203.0.113.10"),
-            Some(endpoint_route),
-        )
-        .expect("plan");
+        let plan = RoutePlan::build("tun-test0", &tun(), Some(endpoint_route), &[]).expect("plan");
 
         assert_eq!(
             plan.loop_protection[0].to_string(),
@@ -407,13 +509,7 @@ mod tests {
             dev: "eth0".to_string(),
         };
 
-        let plan = RoutePlan::build(
-            "tun-test0",
-            &tun(),
-            &outbound("2001:db8::10"),
-            Some(endpoint_route),
-        )
-        .expect("plan");
+        let plan = RoutePlan::build("tun-test0", &tun(), Some(endpoint_route), &[]).expect("plan");
 
         assert_eq!(
             plan.loop_protection[0].to_string(),
@@ -426,5 +522,35 @@ mod tests {
         assert!(validate_tun_address("10.10.0.2").is_err());
         assert!(validate_tun_address("10.10.0.2/33").is_err());
         assert!(validate_tun_address("2001:db8::2/129").is_err());
+    }
+
+    #[test]
+    fn builds_cleanup_for_auto_route() {
+        let previous = vec![DefaultRoute {
+            tokens: vec![
+                "default".to_string(),
+                "via".to_string(),
+                "192.168.1.1".to_string(),
+                "dev".to_string(),
+                "wlan0".to_string(),
+            ],
+        }];
+        let endpoint_route = EndpointRoute {
+            endpoint: "203.0.113.10".parse().expect("ip"),
+            via: Some("192.168.1.1".parse().expect("gateway")),
+            dev: "wlan0".to_string(),
+        };
+        let plan =
+            RoutePlan::build("tun-test0", &tun(), Some(endpoint_route), &previous).expect("plan");
+
+        assert_eq!(
+            plan.cleanup[0].to_string(),
+            "ip route del default dev tun-test0"
+        );
+        assert_eq!(
+            plan.cleanup[1].to_string(),
+            "ip route replace default via 192.168.1.1 dev wlan0"
+        );
+        assert_eq!(plan.cleanup[2].to_string(), "ip route del 203.0.113.10/32");
     }
 }
