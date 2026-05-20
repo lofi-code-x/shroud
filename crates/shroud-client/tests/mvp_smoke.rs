@@ -1,4 +1,5 @@
 use shroud_client::routing::Router;
+use shroud_client::session::SessionCore;
 use shroud_client::socks5;
 use shroud_client::tunnel::TunnelClient;
 use shroud_core::config::{
@@ -237,9 +238,10 @@ async fn start_socks_client_with_dns(
         outbound_config(tunnel_addr, tunnel_path),
         auth_config(client_secret),
     );
+    let session = SessionCore::new(router, tunnel, dns);
 
     let handle = tokio::spawn(async move {
-        let _ = socks5::serve(listen, router, tunnel, dns).await;
+        let _ = socks5::serve(listen, session).await;
     });
     wait_for_tcp(listen).await?;
     Ok(RunningTask {

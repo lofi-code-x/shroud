@@ -1,5 +1,15 @@
-inbound:
-  listen: "127.0.0.1:1080"
+inbounds:
+  socks:
+    enabled: true
+    listen: "127.0.0.1:1080"
+
+  tun:
+    enabled: false
+    name: "shroud0"
+    address: "10.10.0.2/24"
+    mtu: 1400
+    auto_route: false
+    dns: "10.10.0.53"
 
 outbound:
   server: "127.0.0.1"

@@ -51,12 +51,15 @@ impl TunnelClient {
         self.open_tunnel(target_host, target_port).await
     }
 
-    pub async fn relay_over_tunnel_stream(
+    pub async fn relay_over_tunnel_stream<S>(
         &self,
-        client_socket: &mut TcpStream,
+        client_socket: &mut S,
         upstream: &mut TunnelStream,
-    ) -> Result<RelayStats> {
-        let (mut client_read, mut client_write) = client_socket.split();
+    ) -> Result<RelayStats>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (mut client_read, mut client_write) = tokio::io::split(client_socket);
         let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
 
         let client_to_upstream = async {

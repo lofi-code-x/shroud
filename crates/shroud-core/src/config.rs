@@ -1,9 +1,10 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientConfig {
-    pub inbound: SocksInboundConfig,
+    pub inbound: Option<SocksInboundConfig>,
+    pub inbounds: ClientInboundsConfig,
     pub outbound: OutboundConfig,
     pub auth: ClientAuthConfig,
     pub routing: RoutingConfig,
@@ -17,14 +18,18 @@ impl<'de> Deserialize<'de> for ClientConfig {
     {
         let raw = ClientConfigRaw::deserialize(deserializer)?;
 
-        let inbound = raw
-            .inbound
-            .or_else(|| raw.inbounds.and_then(|inbounds| inbounds.socks))
-            .ok_or_else(|| {
-                serde::de::Error::custom(
-                    "missing inbound config: expected either `inbound.listen` or `inbounds.socks.listen`",
-                )
-            })?;
+        let mut inbounds: ClientInboundsConfig = raw.inbounds.unwrap_or_default().into();
+        if let Some(legacy_socks) = raw.inbound {
+            inbounds.socks = Some(legacy_socks);
+        }
+
+        if !inbounds.has_enabled_inbound() {
+            return Err(serde::de::Error::custom(
+                "missing enabled inbound config: expected `inbound.listen`, enabled `inbounds.socks.listen`, or enabled `inbounds.tun`",
+            ));
+        }
+
+        let inbound = inbounds.socks.clone();
 
         let outbound = raw
             .outbound
@@ -46,6 +51,7 @@ impl<'de> Deserialize<'de> for ClientConfig {
 
         Ok(Self {
             inbound,
+            inbounds,
             outbound,
             auth,
             routing,
@@ -56,7 +62,56 @@ impl<'de> Deserialize<'de> for ClientConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SocksInboundConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub listen: SocketAddr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClientInboundsConfig {
+    #[serde(default)]
+    pub socks: Option<SocksInboundConfig>,
+    #[serde(default)]
+    pub tun: TunInboundConfig,
+}
+
+impl ClientInboundsConfig {
+    pub fn has_enabled_inbound(&self) -> bool {
+        self.socks
+            .as_ref()
+            .map(|socks| socks.enabled)
+            .unwrap_or(false)
+            || self.tun.enabled
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunInboundConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_tun_name")]
+    pub name: String,
+    #[serde(default = "default_tun_address")]
+    pub address: String,
+    #[serde(default = "default_tun_mtu")]
+    pub mtu: u16,
+    #[serde(default)]
+    pub auto_route: bool,
+    #[serde(default)]
+    pub dns: Option<IpAddr>,
+}
+
+impl Default for TunInboundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            name: default_tun_name(),
+            address: default_tun_address(),
+            mtu: default_tun_mtu(),
+            auto_route: false,
+            dns: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +190,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_tun_name() -> String {
+    "tun0".to_string()
+}
+
+fn default_tun_address() -> String {
+    "10.10.0.2/24".to_string()
+}
+
+fn default_tun_mtu() -> u16 {
+    1400
+}
+
 impl Default for RouteAction {
     fn default() -> Self {
         default_route_action()
@@ -189,6 +256,26 @@ struct ClientConfigRaw {
 struct ClientInboundsRaw {
     #[serde(default)]
     socks: Option<SocksInboundConfig>,
+    #[serde(default)]
+    tun: TunInboundConfig,
+}
+
+impl Default for ClientInboundsRaw {
+    fn default() -> Self {
+        Self {
+            socks: None,
+            tun: TunInboundConfig::default(),
+        }
+    }
+}
+
+impl From<ClientInboundsRaw> for ClientInboundsConfig {
+    fn from(raw: ClientInboundsRaw) -> Self {
+        Self {
+            socks: raw.socks,
+            tun: raw.tun,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,5 +320,104 @@ auth:
         assert!(!cfg.dns.remote_by_default);
         assert!(!cfg.dns.warn_on_ip_targets);
         assert!(cfg.dns.block_ip_targets);
+    }
+
+    #[test]
+    fn client_config_normalizes_legacy_inbound_into_inbounds_socks() {
+        let cfg: ClientConfig = serde_yaml::from_str(BASE_CLIENT_CONFIG).expect("parse config");
+
+        let legacy = cfg.inbound.expect("legacy inbound alias");
+        let socks = cfg.inbounds.socks.expect("normalized socks inbound");
+
+        assert!(legacy.enabled);
+        assert_eq!(legacy.listen.to_string(), "127.0.0.1:1080");
+        assert!(socks.enabled);
+        assert_eq!(socks.listen.to_string(), "127.0.0.1:1080");
+        assert!(!cfg.inbounds.tun.enabled);
+        assert_eq!(cfg.inbounds.tun.name, "tun0");
+        assert_eq!(cfg.inbounds.tun.address, "10.10.0.2/24");
+        assert_eq!(cfg.inbounds.tun.mtu, 1400);
+        assert!(!cfg.inbounds.tun.auto_route);
+        assert!(cfg.inbounds.tun.dns.is_none());
+    }
+
+    #[test]
+    fn client_config_accepts_inbounds_socks_shape() {
+        let raw = r#"
+inbounds:
+  socks:
+    listen: "127.0.0.1:1081"
+outbound:
+  server: "127.0.0.1"
+  port: 8443
+  path: "/api/tunnel"
+  tls: true
+auth:
+  client_id: "11111111-1111-1111-1111-111111111111"
+  client_secret: "secret"
+"#;
+
+        let cfg: ClientConfig = serde_yaml::from_str(raw).expect("parse config");
+        let socks = cfg.inbounds.socks.expect("socks inbound");
+
+        assert!(socks.enabled);
+        assert_eq!(socks.listen.to_string(), "127.0.0.1:1081");
+        assert!(cfg.inbound.is_some());
+    }
+
+    #[test]
+    fn client_config_accepts_tun_inbound_shape() {
+        let raw = r#"
+inbounds:
+  tun:
+    enabled: true
+    name: "tun-test0"
+    address: "10.20.0.2/24"
+    mtu: 1300
+    auto_route: true
+    dns: "10.20.0.53"
+outbound:
+  server: "127.0.0.1"
+  port: 8443
+  path: "/api/tunnel"
+  tls: true
+auth:
+  client_id: "11111111-1111-1111-1111-111111111111"
+  client_secret: "secret"
+"#;
+
+        let cfg: ClientConfig = serde_yaml::from_str(raw).expect("parse config");
+
+        assert!(cfg.inbound.is_none());
+        assert!(cfg.inbounds.socks.is_none());
+        assert!(cfg.inbounds.tun.enabled);
+        assert_eq!(cfg.inbounds.tun.name, "tun-test0");
+        assert_eq!(cfg.inbounds.tun.address, "10.20.0.2/24");
+        assert_eq!(cfg.inbounds.tun.mtu, 1300);
+        assert!(cfg.inbounds.tun.auto_route);
+        assert_eq!(
+            cfg.inbounds.tun.dns.expect("tun dns").to_string(),
+            "10.20.0.53"
+        );
+    }
+
+    #[test]
+    fn client_config_rejects_missing_enabled_inbounds() {
+        let raw = r#"
+inbounds:
+  socks:
+    enabled: false
+    listen: "127.0.0.1:1080"
+outbound:
+  server: "127.0.0.1"
+  port: 8443
+  path: "/api/tunnel"
+  tls: true
+auth:
+  client_id: "11111111-1111-1111-1111-111111111111"
+  client_secret: "secret"
+"#;
+
+        assert!(serde_yaml::from_str::<ClientConfig>(raw).is_err());
     }
 }

@@ -600,6 +600,7 @@ HTTP/1.1 403 Forbidden
 ```yaml
 inbounds:
   socks:
+    enabled: true
     listen: "127.0.0.1:1080"
 
   tun:
@@ -607,6 +608,8 @@ inbounds:
     name: "tun0"
     address: "10.10.0.2/24"
     mtu: 1400
+    auto_route: false
+    dns: "10.10.0.53"
 
 outbounds:
   proxy:
@@ -759,6 +762,28 @@ block_ip_targets    — strict mode: блокировать IP targets, чтоб
 ```text
 TUN mode → весь DNS тоже через tunnel
 ```
+
+Текущий TUN DNS scaffold в проекте:
+
+```text
+fake DNS listener
+  ↓
+A query example.com
+  ↓
+fake IPv4 from 198.18.0.0/15
+  ↓
+mapping fake_ip → example.com
+  ↓
+future TUN packet engine restores original domain
+```
+
+На этом этапе реализована только подготовка fake DNS:
+
+- `FakeDns` хранит `domain → fake IPv4` и `fake IPv4 → domain`;
+- A-запросы получают fake IPv4;
+- AAAA и другие типы пока получают NOERROR без answer;
+- listener address берётся из `inbounds.tun.dns`, порт — `53`;
+- сам listener будет запускаться вместе с TUN packet engine.
 
 ---
 
@@ -1248,7 +1273,89 @@ advanced DNS
 
 ---
 
-## 29. Краткое сравнение с VLESS и SOCKS5
+## 29. TUN implementation status
+
+Текущий код уже подготовлен к TUN mode, но полноценный VPN-like режим ещё не включён.
+
+Реализовано:
+
+```text
+SOCKS handler → shared SessionCore
+TUN config parsing
+Linux /dev/net/tun open + TUNSETIFF
+Linux interface setup plan: address, MTU, link up
+loop-protection route plan for IP tunnel endpoint
+fake DNS mapping layer
+```
+
+Пока намеренно не реализовано:
+
+```text
+TUN packet read loop
+tun2socks-like TCP stack
+UDP relay
+automatic default route switch
+system DNS switch
+route cleanup on shutdown
+```
+
+Почему default route пока не применяется:
+
+```text
+Если заменить default route на tun0 до появления packet engine,
+системный трафик попадёт в интерфейс, но клиент ещё не сможет обработать IP-пакеты.
+Это приведёт к потере сетевого доступа.
+```
+
+Текущее безопасное поведение:
+
+```text
+inbounds.tun.enabled = true
+  ↓
+создать TUN device
+  ↓
+назначить address / MTU / up
+  ↓
+если auto_route=true, добавить route exception для tunnel server IP
+  ↓
+не менять default route
+  ↓
+остановиться с явной ошибкой: TUN runtime is not implemented yet
+```
+
+Manual smoke check на Linux:
+
+```bash
+sudo RUST_LOG=debug cargo run -p shroud-client -- configs/client.yaml
+```
+
+Для этой проверки в `configs/client.yaml` нужно временно включить:
+
+```yaml
+inbounds:
+  tun:
+    enabled: true
+    name: "tun0"
+    address: "10.10.0.2/24"
+    mtu: 1400
+    auto_route: false
+    dns: "10.10.0.53"
+```
+
+Ожидаемый результат:
+
+```text
+клиент открывает TUN device,
+логирует planned route setup,
+логирует fake DNS listen address,
+затем завершается до запуска packet engine.
+```
+
+Для проверки loop-protection route нужно указывать `outbound.server` как IP-адрес. Если `outbound.server` — домен, route exception пока не строится, потому что DNS resolution tunnel endpoint'а ещё не вынесен в отдельный bootstrap шаг.
+
+---
+
+## 30. Краткое сравнение с VLESS и SOCKS5
 
 ### SOCKS5
 

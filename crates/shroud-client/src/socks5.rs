@@ -1,18 +1,11 @@
-use crate::routing::Router;
-use crate::tunnel::TunnelClient;
+use crate::session::{DnsPolicyResult, SessionContext, SessionCore, TcpOpenResult};
 use anyhow::{Context, Result, bail};
-use shroud_core::config::{ClientDnsConfig, RouteAction};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-pub async fn serve(
-    listen: SocketAddr,
-    router: Router,
-    tunnel: TunnelClient,
-    dns: ClientDnsConfig,
-) -> Result<()> {
+pub async fn serve(listen: SocketAddr, session: SessionCore) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     info!(%listen, "SOCKS5 inbound listener started");
 
@@ -20,12 +13,10 @@ pub async fn serve(
         let (socket, peer) = listener.accept().await?;
         debug!(%peer, "new connection");
 
-        let router = router.clone();
-        let tunnel = tunnel.clone();
-        let dns = dns.clone();
+        let session = session.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(socket, peer, router, tunnel, dns).await {
+            if let Err(err) = handle_connection(socket, peer, session).await {
                 debug!(%peer, error = %err, "connection handling failed");
             }
         });
@@ -73,10 +64,10 @@ pub async fn serve(
 /// target_port = request.port
 /// ```
 ///
-/// 4. Uses the [`Router`] to decide how the connection should be handled:
+/// 4. Uses the [`SessionCore`] to decide how the connection should be handled:
 ///
 /// ```text
-/// router.decide(target_host, target_port)
+/// session.open_tcp(target_host, target_port)
 /// ```
 ///
 /// 5. Executes the selected route action:
@@ -89,16 +80,14 @@ pub async fn serve(
 ///
 /// * `socket` - TCP connection accepted from the local SOCKS5 client.
 /// * `peer` - Socket address of the connected client. Used for logging.
-/// * `router` - Routing engine used to decide whether the target should be
-///   proxied, connected directly, or blocked.
-/// * `tunnel` - Tunnel client used to open proxied connections through the
-///   remote tunnel server.
+/// * `session` - Shared session core used to apply DNS policy, choose the route,
+///   open the upstream side, and relay traffic.
 ///
 /// # Route behavior
 ///
 /// ## `RouteAction::Proxy`
 ///
-/// When the router returns `RouteAction::Proxy`, this function attempts to
+/// When the session route is `RouteAction::Proxy`, this function attempts to
 /// connect to the requested target through the tunnel:
 ///
 /// ```text
@@ -114,10 +103,10 @@ pub async fn serve(
 ///
 /// If the tunnel connection succeeds, the function sends a SOCKS5 `Succeeded`
 /// reply and starts relaying data between the local client socket and the
-/// tunnel stream using:
+/// upstream stream using:
 ///
 /// ```text
-/// tunnel.relay_over_tunnel_stream(...)
+/// session.relay_tcp(...)
 /// ```
 ///
 /// After the relay finishes, the function logs byte counters for both
@@ -125,7 +114,7 @@ pub async fn serve(
 ///
 /// ## `RouteAction::Direct`
 ///
-/// When the router returns `RouteAction::Direct`, this function opens a direct
+/// When the session route is `RouteAction::Direct`, this function opens a direct
 /// TCP connection to the requested target:
 ///
 /// ```text
@@ -138,15 +127,15 @@ pub async fn serve(
 /// `GeneralFailure` reply to the client and returns an error.
 ///
 /// If the direct connection succeeds, the function sends a SOCKS5 `Succeeded`
-/// reply and starts bidirectional copying between the client socket and the
-/// upstream TCP stream using [`copy_bidirectional`].
+/// reply and relays data between the client socket and the upstream TCP stream
+/// through the session core.
 ///
 /// After the relay finishes, the function logs byte counters for both
 /// directions.
 ///
 /// ## `RouteAction::Block`
 ///
-/// When the router returns `RouteAction::Block`, this function rejects the
+/// When the session route is `RouteAction::Block`, this function rejects the
 /// request by sending a SOCKS5 `ConnectionNotAllowed` reply.
 ///
 /// No upstream connection is opened in this case.
@@ -157,7 +146,7 @@ pub async fn serve(
 ///
 /// - `ReplyCode::Succeeded` if the upstream connection was established.
 /// - `ReplyCode::GeneralFailure` if proxy/direct upstream connection failed.
-/// - `ReplyCode::ConnectionNotAllowed` if the router blocked the target.
+/// - `ReplyCode::ConnectionNotAllowed` if the session core blocked the target.
 ///
 /// The success reply is sent only after the upstream side is actually ready.
 /// This prevents the client from assuming that the connection is established
@@ -187,10 +176,8 @@ pub async fn serve(
 /// - [`handshake`];
 /// - [`read_connect_request`];
 /// - [`write_reply`];
-/// - `tunnel.connect_target_via_tunnel`;
-/// - `tunnel.relay_over_tunnel_stream`;
-/// - [`TcpStream::connect`];
-/// - [`copy_bidirectional`].
+/// - [`SessionCore::open_tcp`];
+/// - [`SessionCore::relay_tcp`].
 ///
 /// Additional context is attached to some errors, for example:
 ///
@@ -210,109 +197,58 @@ pub async fn serve(
 async fn handle_connection(
     mut socket: TcpStream,
     peer: SocketAddr,
-    router: Router,
-    tunnel: TunnelClient,
-    dns: ClientDnsConfig,
+    session: SessionCore,
 ) -> Result<()> {
     handshake(&mut socket).await?;
     let request = read_connect_request(&mut socket).await?;
     let target_host = request.host.as_str();
     let target_port = request.port;
-    if let Some(target_ip) = target_host.parse::<IpAddr>().ok() {
-        if dns.warn_on_ip_targets {
-            warn!(
-                %peer,
-                %target_ip,
-                target_port,
-                remote_by_default = dns.remote_by_default,
-                block_ip_targets = dns.block_ip_targets,
-                "SOCKS target is an IP address; remote DNS cannot be applied because the application likely resolved the name locally"
-            );
-        }
 
-        if dns.block_ip_targets {
-            write_reply(&mut socket, ReplyCode::ConnectionNotAllowed).await?;
-            debug!(%peer, target_host, target_port, "blocked IP target by DNS policy");
-            return Ok(());
-        }
-    } else if dns.remote_by_default {
-        debug!(
-            %peer,
+    if matches!(
+        session.check_dns_policy(
             target_host,
             target_port,
-            "SOCKS target is a domain; preserving it for remote resolution"
-        );
+            SessionContext {
+                inbound: "socks5",
+                peer: Some(peer),
+            },
+        ),
+        DnsPolicyResult::BlockedIpTarget
+    ) {
+        write_reply(&mut socket, ReplyCode::ConnectionNotAllowed).await?;
+        debug!(%peer, target_host, target_port, "blocked IP target by DNS policy");
+        return Ok(());
     }
 
-    let action = router.decide(target_host, target_port);
-
-    match action {
-        RouteAction::Proxy => {
-            //connect to the tunnel server and open a tunnel to the target
-            let mut upstream = match tunnel
-                .connect_target_via_tunnel(target_host, target_port)
-                .await
-            {
-                Ok(stream) => stream,
-                Err(err) => {
-                    //if the tunnel connection fails, the upstream stream will be dropped
-                    write_reply(&mut socket, ReplyCode::GeneralFailure).await?;
-                    return Err(err).context("proxy tunnel connect failed");
-                }
-            };
-
-            //if the tunnel connection succeeds, start relaying data between the local client socket and the tunnel stream
-            write_reply(&mut socket, ReplyCode::Succeeded).await?;
-            //relay data between client and upstream
-            let stats = tunnel
-                .relay_over_tunnel_stream(&mut socket, &mut upstream)
-                .await
-                .context("proxy relay failed")?;
-            debug!(
-                %peer,
-                target_host,
-                target_port,
-                route = ?action,
-                client_to_upstream_bytes = stats.client_to_upstream_bytes,
-                upstream_to_client_bytes = stats.upstream_to_client_bytes,
-                "connection relay finished"
-            );
-        }
-        RouteAction::Direct => {
-            let mut upstream = match TcpStream::connect((target_host, target_port)).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    write_reply(&mut socket, ReplyCode::GeneralFailure).await?;
-                    return Err(err).with_context(|| {
-                        format!(
-                            "failed to open direct tcp connection to {target_host}:{target_port}"
-                        )
-                    });
-                }
-            };
-
-            write_reply(&mut socket, ReplyCode::Succeeded).await?;
-            let (client_to_upstream_bytes, upstream_to_client_bytes) =
-                copy_bidirectional(&mut socket, &mut upstream)
-                    .await
-                    .with_context(|| format!("relay failed for {target_host}:{target_port}"))?;
-
-            debug!(
-                %peer,
-                target_host,
-                target_port,
-                route = ?action,
-                client_to_upstream_bytes,
-                upstream_to_client_bytes,
-                "connection relay finished"
-            );
-        }
-        RouteAction::Block => {
+    let mut outbound = match session.open_tcp(target_host, target_port).await {
+        Ok(TcpOpenResult::Opened(outbound)) => outbound,
+        Ok(TcpOpenResult::Blocked) => {
             write_reply(&mut socket, ReplyCode::ConnectionNotAllowed).await?;
             debug!(%peer, target_host, target_port, "blocked by route rule");
             return Ok(());
         }
-    }
+        Err(err) => {
+            write_reply(&mut socket, ReplyCode::GeneralFailure).await?;
+            return Err(err);
+        }
+    };
+
+    write_reply(&mut socket, ReplyCode::Succeeded).await?;
+    let action = outbound.action;
+    let stats = session
+        .relay_tcp(&mut socket, &mut outbound)
+        .await
+        .with_context(|| format!("relay failed for {target_host}:{target_port}"))?;
+
+    debug!(
+        %peer,
+        target_host,
+        target_port,
+        route = ?action,
+        client_to_upstream_bytes = stats.client_to_upstream_bytes,
+        upstream_to_client_bytes = stats.upstream_to_client_bytes,
+        "connection relay finished"
+    );
 
     Ok(())
 }
