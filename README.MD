@@ -1,5 +1,98 @@
 # Проектирование собственного VLESS-like proxy/VPN протокола
 
+## Быстрый production-minded запуск
+
+Сгенерировать пару клиента:
+
+```bash
+cargo run -p shroud-server -- generate-credentials
+```
+
+Вывод можно вставить в `auth` клиентского конфига и в `clients[]` серверного конфига.
+
+Пример `configs/client.yaml`:
+
+```yaml
+inbounds:
+  socks:
+    enabled: true
+    listen: "127.0.0.1:1080"
+outbound:
+  server: "vpn.example.com"
+  port: 443
+  path: "/api/tunnel"
+  tls: true
+  tls_server_name: "vpn.example.com"
+auth:
+  client_id: "11111111-1111-1111-1111-111111111111"
+  client_secret: "replace-with-generated-secret"
+routing:
+  default: "proxy"
+  rules:
+    - action: "direct"
+      domain_suffix: ".local"
+    - action: "direct"
+      cidr: "127.0.0.0/8"
+```
+
+Пример `configs/server.yaml`:
+
+```yaml
+listen: "0.0.0.0:443"
+tunnel_path: "/api/tunnel"
+web_root: "./web"
+tls:
+  enabled: true
+  cert_path: "/etc/letsencrypt/live/vpn.example.com/fullchain.pem"
+  key_path: "/etc/letsencrypt/live/vpn.example.com/privkey.pem"
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "replace-with-generated-secret"
+```
+
+Для private CA клиент должен доверять корневому сертификату:
+
+```yaml
+outbound:
+  server: "vpn.internal"
+  port: 8443
+  path: "/api/tunnel"
+  tls: true
+  tls_server_name: "vpn.internal"
+  tls_ca_cert_path: "/etc/shroud/private-ca.crt"
+```
+
+Для public CA / Let's Encrypt `tls_ca_cert_path` не нужен: клиент использует встроенный набор публичных WebPKI root CA.
+
+Запуск:
+
+```bash
+cargo run -p shroud-server -- configs/server.yaml
+cargo run -p shroud-client -- configs/client.yaml
+```
+
+Healthcheck:
+
+```bash
+curl -fsS https://vpn.example.com/api/status
+```
+
+Ответ минимальный и не раскрывает routing/auth/proxy детали:
+
+```json
+{"status":"ok"}
+```
+
+Валидатор конфига запускается до bind/connect и печатает пути к полям, например `outbound.path`, `auth.client_secret`, `routing.rules[0].cidr`.
+
+Security notes:
+
+- Используйте `tls.enabled: true` в production и валидный сертификат public CA или private CA через `tls_ca_cert_path`.
+- Храните `client_secret` как пароль: не коммитьте реальные секреты, ограничивайте права на config-файлы.
+- `client_id` должен быть UUID, `client_secret` должен быть сгенерированным случайным значением.
+- `GET /api/status` не требует auth намеренно, но возвращает только `{"status":"ok"}`.
+- Не публикуйте `tunnel_path`, списки клиентов, routing rules и fallback content в диагностических ответах.
+
 ## TCP-only SOCKS5 tunnel smoke test
 
 Текущий стабильный режим - TCP CONNECT через локальный SOCKS5 inbound и HTTP/1.1 Upgrade tunnel transport. UDP relay пока не реализован.

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use shroud_client::{routing, session, socks5, tun, tunnel};
-use shroud_core::config::ClientConfig;
+use shroud_core::config::{generate_client_credentials, load_client_config_yaml};
 use std::fs;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -26,13 +26,13 @@ async fn main() -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "configs/client.yaml".to_string());
+    let Some(config_path) = parse_cli()? else {
+        return Ok(());
+    };
     let raw = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read client config: {config_path}"))?;
-    let cfg: ClientConfig = serde_yaml::from_str(&raw)
-        .with_context(|| format!("failed to parse client yaml config: {config_path}"))?;
+    let cfg = load_client_config_yaml(&raw)
+        .with_context(|| format!("failed to load client config: {config_path}"))?;
 
     let mut outbound = cfg.outbound.clone();
     if cfg.inbounds.tun.enabled && cfg.inbounds.tun.auto_route {
@@ -79,4 +79,22 @@ async fn main() -> Result<()> {
     info!(listen = %socks.listen, "starting shroud client");
 
     socks5::serve(socks.listen, session).await
+}
+
+fn parse_cli() -> Result<Option<String>> {
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+    if matches!(
+        first.as_deref(),
+        Some("generate-credentials") | Some("gen-credentials")
+    ) {
+        let credentials = generate_client_credentials();
+        println!("client_id: \"{}\"", credentials.client_id);
+        println!("client_secret: \"{}\"", credentials.client_secret);
+        return Ok(None);
+    }
+
+    Ok(Some(
+        first.unwrap_or_else(|| "configs/client.yaml".to_string()),
+    ))
 }

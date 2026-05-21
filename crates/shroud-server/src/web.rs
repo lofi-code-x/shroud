@@ -103,6 +103,10 @@ where
         std::str::from_utf8(&request_raw).context("request headers are not utf-8")?;
     let parsed = parse_http_request(request_text)?;
 
+    if parsed.method == "GET" && parsed.path == "/api/status" {
+        return serve_health_status(&mut stream).await;
+    }
+
     if parsed.method == "POST" && parsed.path == cfg.tunnel_path {
         return handle_tunnel_request(stream, peer, cfg, nonce_cache, parsed).await;
     }
@@ -119,6 +123,20 @@ where
 
     write_error_response(&mut stream, 404, false).await?;
     Ok(())
+}
+
+async fn serve_health_status<S>(stream: &mut S) -> Result<()>
+where
+    S: AsyncWrite + Unpin + ?Sized,
+{
+    write_response(
+        stream,
+        200,
+        "application/json; charset=utf-8",
+        b"{\"status\":\"ok\"}\n",
+        false,
+    )
+    .await
 }
 
 async fn handle_tunnel_request<S>(
@@ -704,6 +722,25 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.ends_with("fallback index"));
+    }
+
+    #[tokio::test]
+    async fn health_status_returns_minimal_neutral_json() {
+        let web_root = TempWebRoot::new();
+        web_root.write("index.html", b"fallback index");
+
+        let response = run_request(
+            &web_root,
+            "GET /api/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("Content-Type: application/json; charset=utf-8"));
+        assert!(response.ends_with("{\"status\":\"ok\"}\n"));
+        assert!(!response.to_ascii_lowercase().contains("proxy"));
+        assert!(!response.to_ascii_lowercase().contains("tunnel"));
+        assert!(!response.to_ascii_lowercase().contains("auth"));
     }
 
     #[tokio::test]

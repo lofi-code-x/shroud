@@ -1,5 +1,5 @@
-use anyhow::{Result, bail};
-use shroud_core::config::{RouteAction, RoutingConfig, RoutingRule};
+use anyhow::Result;
+use shroud_core::config::{RouteAction, RoutingConfig, RoutingRule, validate_routing_config};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Clone)]
@@ -13,7 +13,7 @@ impl Router {
     }
 
     pub fn try_new(config: RoutingConfig) -> Result<Self> {
-        validate_config(&config)?;
+        validate_routing_config(&config)?;
         Ok(Self::new(config))
     }
 
@@ -52,27 +52,6 @@ fn apply_rule(rule: &RoutingRule, target_host: &str, target_port: u16) -> Option
     }
 
     Some(rule.action)
-}
-
-fn validate_config(config: &RoutingConfig) -> Result<()> {
-    for (index, rule) in config.rules.iter().enumerate() {
-        if let Some(cidr) = &rule.cidr {
-            let Some((network, prefix_len)) = parse_cidr(cidr) else {
-                bail!("routing.rules[{index}].cidr is not valid CIDR: {cidr}");
-            };
-            match network {
-                IpAddr::V4(_) if prefix_len > 32 => {
-                    bail!("routing.rules[{index}].cidr has invalid IPv4 prefix: {cidr}")
-                }
-                IpAddr::V6(_) if prefix_len > 128 => {
-                    bail!("routing.rules[{index}].cidr has invalid IPv6 prefix: {cidr}")
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn domain_matches(domain: &str, target_host: &str) -> bool {
