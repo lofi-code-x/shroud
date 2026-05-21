@@ -286,6 +286,53 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_short_header() {
+        let err = Frame::decode(Bytes::from_static(b"\x01\x11"))
+            .expect_err("short frame header must fail");
+        assert!(matches!(err, ProtocolError::FrameTooShort(2)));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_payload() {
+        let mut encoded = BytesMut::with_capacity(HEADER_LEN + 2);
+        encoded.put_u8(PROTOCOL_VERSION);
+        encoded.put_u8(FrameType::TcpData as u8);
+        encoded.put_u64(1);
+        encoded.put_u16(0);
+        encoded.put_u32(3);
+        encoded.extend_from_slice(b"ab");
+
+        let err = Frame::decode(encoded.freeze()).expect_err("truncated payload must fail");
+        assert!(matches!(
+            err,
+            ProtocolError::PayloadLengthMismatch {
+                expected: 3,
+                got: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_payload_length_with_trailing_bytes() {
+        let mut encoded = BytesMut::with_capacity(HEADER_LEN + 3);
+        encoded.put_u8(PROTOCOL_VERSION);
+        encoded.put_u8(FrameType::TcpData as u8);
+        encoded.put_u64(1);
+        encoded.put_u16(0);
+        encoded.put_u32(2);
+        encoded.extend_from_slice(b"abc");
+
+        let err = Frame::decode(encoded.freeze()).expect_err("trailing payload bytes must fail");
+        assert!(matches!(
+            err,
+            ProtocolError::PayloadLengthMismatch {
+                expected: 2,
+                got: 3
+            }
+        ));
+    }
+
+    #[test]
     fn roundtrip_connect_payload_domain() {
         let payload = encode_tcp_connect_payload("example.com", 443).expect("encode");
         let (host, port) = decode_tcp_connect_payload(payload.as_ref()).expect("decode");
