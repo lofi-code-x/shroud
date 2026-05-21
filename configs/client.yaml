@@ -4,7 +4,7 @@ inbounds:
     listen: "127.0.0.1:1080"
 
   tun:
-    enabled: true
+    enabled: false
     name: "shroud0"
     address: "10.10.0.2/24"
     mtu: 1400

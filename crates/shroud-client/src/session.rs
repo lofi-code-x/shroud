@@ -3,9 +3,14 @@ use crate::tunnel::{RelayStats, TunnelClient, TunnelStream};
 use anyhow::{Context, Result};
 use shroud_core::config::{ClientDnsConfig, RouteAction};
 use std::net::{IpAddr, SocketAddr};
-use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tracing::{debug, warn};
+
+const DIRECT_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub struct SessionCore {
@@ -78,13 +83,19 @@ impl SessionCore {
                 }))
             }
             RouteAction::Direct => {
-                let stream = TcpStream::connect((target_host, target_port))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to open direct tcp connection to {target_host}:{target_port}"
-                        )
-                    })?;
+                let stream = timeout(
+                    DIRECT_TARGET_CONNECT_TIMEOUT,
+                    TcpStream::connect((target_host, target_port)),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "timed out opening direct tcp connection to {target_host}:{target_port}"
+                    )
+                })?
+                .with_context(|| {
+                    format!("failed to open direct tcp connection to {target_host}:{target_port}")
+                })?;
                 Ok(TcpOpenResult::Opened(TcpOutbound {
                     action,
                     stream: TcpOutboundStream::Direct(stream),
@@ -108,19 +119,75 @@ impl SessionCore {
                 .relay_over_tunnel_stream(client_stream, upstream)
                 .await
                 .context("proxy relay failed"),
-            TcpOutboundStream::Direct(upstream) => {
-                let (client_to_upstream_bytes, upstream_to_client_bytes) =
-                    copy_bidirectional(client_stream, upstream)
-                        .await
-                        .context("direct relay failed")?;
-
-                Ok(RelayStats {
-                    client_to_upstream_bytes,
-                    upstream_to_client_bytes,
-                })
-            }
+            TcpOutboundStream::Direct(upstream) => relay_direct_tcp(client_stream, upstream)
+                .await
+                .context("direct relay failed"),
         }
     }
+}
+
+async fn relay_direct_tcp<S>(client_stream: &mut S, upstream: &mut TcpStream) -> Result<RelayStats>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+
+    let client_to_upstream = async {
+        let mut transferred = 0u64;
+        let mut buf = [0u8; 16 * 1024];
+
+        loop {
+            let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))
+                .await
+                .context("relay idle timeout while reading from client")??;
+            if n == 0 {
+                timeout(RELAY_IDLE_TIMEOUT, upstream_write.shutdown())
+                    .await
+                    .context("relay timeout while shutting down upstream writer")??;
+                break;
+            }
+
+            transferred += n as u64;
+            timeout(RELAY_IDLE_TIMEOUT, upstream_write.write_all(&buf[..n]))
+                .await
+                .context("relay timeout while writing to upstream")??;
+        }
+
+        Ok::<u64, anyhow::Error>(transferred)
+    };
+
+    let upstream_to_client = async {
+        let mut transferred = 0u64;
+        let mut buf = [0u8; 16 * 1024];
+
+        loop {
+            let n = timeout(RELAY_IDLE_TIMEOUT, upstream_read.read(&mut buf))
+                .await
+                .context("relay idle timeout while reading from upstream")??;
+            if n == 0 {
+                timeout(RELAY_IDLE_TIMEOUT, client_write.shutdown())
+                    .await
+                    .context("relay timeout while shutting down client writer")??;
+                break;
+            }
+
+            transferred += n as u64;
+            timeout(RELAY_IDLE_TIMEOUT, client_write.write_all(&buf[..n]))
+                .await
+                .context("relay timeout while writing to client")??;
+        }
+
+        Ok::<u64, anyhow::Error>(transferred)
+    };
+
+    let (client_to_upstream_bytes, upstream_to_client_bytes) =
+        tokio::try_join!(client_to_upstream, upstream_to_client)?;
+
+    Ok(RelayStats {
+        client_to_upstream_bytes,
+        upstream_to_client_bytes,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

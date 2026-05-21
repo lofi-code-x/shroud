@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 16;
+pub const MAX_FRAME_PAYLOAD_LEN: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -47,6 +48,10 @@ pub struct Frame {
 
 impl Frame {
     pub fn encode(&self) -> Bytes {
+        assert!(
+            self.payload.len() <= MAX_FRAME_PAYLOAD_LEN,
+            "frame payload exceeds maximum size"
+        );
         let mut out = BytesMut::with_capacity(HEADER_LEN + self.payload.len());
         out.put_u8(PROTOCOL_VERSION);
         out.put_u8(self.frame_type as u8);
@@ -74,6 +79,13 @@ impl Frame {
         let stream_id = src.get_u64();
         let flags = src.get_u16();
         let length = src.get_u32() as usize;
+
+        if length > MAX_FRAME_PAYLOAD_LEN {
+            return Err(ProtocolError::FramePayloadTooLarge {
+                max: MAX_FRAME_PAYLOAD_LEN,
+                got: length,
+            });
+        }
 
         if src.len() != length {
             return Err(ProtocolError::PayloadLengthMismatch {
@@ -124,6 +136,8 @@ pub enum ProtocolError {
     VersionMismatch { got: u8, expected: u8 },
     #[error("payload length mismatch: expected={expected}, got={got}")]
     PayloadLengthMismatch { expected: usize, got: usize },
+    #[error("frame payload too large: max={max}, got={got}")]
+    FramePayloadTooLarge { max: usize, got: usize },
     #[error("invalid connect payload: {0}")]
     InvalidConnectPayload(&'static str),
     #[error("domain is too long for protocol: {0} bytes")]
@@ -256,6 +270,19 @@ mod tests {
         assert_eq!(decoded.stream_id, 42);
         assert_eq!(decoded.flags, 1);
         assert_eq!(decoded.payload, Bytes::from_static(b"hello"));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_payload_length() {
+        let mut encoded = BytesMut::with_capacity(HEADER_LEN);
+        encoded.put_u8(PROTOCOL_VERSION);
+        encoded.put_u8(FrameType::TcpData as u8);
+        encoded.put_u64(1);
+        encoded.put_u16(0);
+        encoded.put_u32((MAX_FRAME_PAYLOAD_LEN + 1) as u32);
+
+        let err = Frame::decode(encoded.freeze()).expect_err("oversized frame must fail");
+        assert!(matches!(err, ProtocolError::FramePayloadTooLarge { .. }));
     }
 
     #[test]

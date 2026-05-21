@@ -15,6 +15,8 @@ use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -25,11 +27,13 @@ const ALLOWED_TIMESTAMP_SKEW_SECS: i64 = 120;
 const NONCE_LEN: usize = 16;
 const NONCE_HEADER_LEN: usize = 22;
 const NONCE_CACHE_TTL_SECS: u64 = (ALLOWED_TIMESTAMP_SKEW_SECS as u64) * 2;
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
     let tls_acceptor = build_tls_acceptor(&cfg.tls)?;
     let nonce_cache = Arc::new(NonceCache::new(Duration::from_secs(NONCE_CACHE_TTL_SECS)));
+    let mut active = JoinSet::new();
     info!(
         listen = %cfg.listen,
         tls = cfg.tls.enabled,
@@ -37,26 +41,52 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     );
 
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let cfg = cfg.clone();
-        let tls_acceptor = tls_acceptor.clone();
-        let nonce_cache = nonce_cache.clone();
-
-        tokio::spawn(async move {
-            let result = if let Some(acceptor) = tls_acceptor {
-                match acceptor.accept(stream).await {
-                    Ok(stream) => handle_connection(stream, peer, cfg, nonce_cache).await,
-                    Err(err) => Err(anyhow!(err)).context("tls handshake failed"),
-                }
-            } else {
-                handle_connection(stream, peer, cfg, nonce_cache).await
-            };
-
-            if let Err(err) = result {
-                debug!(%peer, error = %err, "failed to handle incoming connection");
+        tokio::select! {
+            shutdown = tokio::signal::ctrl_c() => {
+                shutdown.context("failed to listen for Ctrl+C")?;
+                info!(listen = %cfg.listen, active_sessions = active.len(), "server listener shutting down");
+                break;
             }
-        });
+            accept_result = listener.accept() => {
+                let (stream, peer) = accept_result?;
+                let cfg = cfg.clone();
+                let tls_acceptor = tls_acceptor.clone();
+                let nonce_cache = nonce_cache.clone();
+
+                active.spawn(async move {
+                    let result = if let Some(acceptor) = tls_acceptor {
+                        match acceptor.accept(stream).await {
+                            Ok(stream) => handle_connection(stream, peer, cfg, nonce_cache).await,
+                            Err(err) => Err(anyhow!(err)).context("tls handshake failed"),
+                        }
+                    } else {
+                        handle_connection(stream, peer, cfg, nonce_cache).await
+                    };
+
+                    if let Err(err) = result {
+                        debug!(%peer, error = %err, "failed to handle incoming connection");
+                    }
+                });
+            }
+            result = active.join_next(), if !active.is_empty() => {
+                if let Some(Err(err)) = result {
+                    debug!(error = %err, "server connection task join failed");
+                }
+            }
+        }
     }
+
+    active.abort_all();
+    let _ = timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+        while let Some(result) = active.join_next().await {
+            if let Err(err) = result {
+                debug!(error = %err, "server connection task stopped during shutdown");
+            }
+        }
+    })
+    .await;
+
+    Ok(())
 }
 
 async fn handle_connection<S>(

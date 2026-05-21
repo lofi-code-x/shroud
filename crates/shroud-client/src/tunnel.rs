@@ -4,13 +4,16 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use bytes::Bytes;
 use shroud_core::auth::compute_auth_tag;
 use shroud_core::config::{ClientAuthConfig, OutboundConfig};
-use shroud_core::protocol::{Frame, FrameType, HEADER_LEN, encode_tcp_connect_payload};
+use shroud_core::protocol::{
+    Frame, FrameType, HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, encode_tcp_connect_payload,
+};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -19,6 +22,10 @@ use tracing::debug;
 const MAX_HTTP_HEADERS: usize = 16 * 1024;
 const STREAM_ID: u64 = 1;
 const CONNECT_OK_FLAG: u16 = 0x0001;
+const TUNNEL_ENDPOINT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_UPGRADE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_CONNECT_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -67,29 +74,41 @@ impl TunnelClient {
             let mut buf = [0u8; 16 * 1024];
 
             loop {
-                let n = client_read.read(&mut buf).await?;
+                let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))
+                    .await
+                    .context("relay idle timeout while reading from SOCKS client")??;
                 if n == 0 {
-                    write_frame(
-                        &mut upstream_write,
-                        FrameType::TcpClose,
-                        STREAM_ID,
-                        0,
-                        Bytes::new(),
+                    timeout(
+                        RELAY_IDLE_TIMEOUT,
+                        write_frame(
+                            &mut upstream_write,
+                            FrameType::TcpClose,
+                            STREAM_ID,
+                            0,
+                            Bytes::new(),
+                        ),
                     )
-                    .await?;
-                    upstream_write.shutdown().await?;
+                    .await
+                    .context("relay timeout while writing TCP_CLOSE to tunnel")??;
+                    timeout(RELAY_IDLE_TIMEOUT, upstream_write.shutdown())
+                        .await
+                        .context("relay timeout while shutting down tunnel writer")??;
                     break;
                 }
 
                 transferred += n as u64;
-                write_frame(
-                    &mut upstream_write,
-                    FrameType::TcpData,
-                    STREAM_ID,
-                    0,
-                    Bytes::copy_from_slice(&buf[..n]),
+                timeout(
+                    RELAY_IDLE_TIMEOUT,
+                    write_frame(
+                        &mut upstream_write,
+                        FrameType::TcpData,
+                        STREAM_ID,
+                        0,
+                        Bytes::copy_from_slice(&buf[..n]),
+                    ),
                 )
-                .await?;
+                .await
+                .context("relay timeout while writing TCP_DATA to tunnel")??;
             }
 
             Ok::<u64, anyhow::Error>(transferred)
@@ -99,7 +118,9 @@ impl TunnelClient {
             let mut transferred = 0u64;
 
             loop {
-                let frame = read_frame(&mut upstream_read).await?;
+                let frame = timeout(RELAY_IDLE_TIMEOUT, read_frame(&mut upstream_read))
+                    .await
+                    .context("relay idle timeout while reading from tunnel")??;
                 if frame.stream_id != STREAM_ID {
                     bail!("unexpected stream id from server: {}", frame.stream_id);
                 }
@@ -107,7 +128,12 @@ impl TunnelClient {
                 match frame.frame_type {
                     FrameType::TcpData => {
                         transferred += frame.payload.len() as u64;
-                        client_write.write_all(frame.payload.as_ref()).await?;
+                        timeout(
+                            RELAY_IDLE_TIMEOUT,
+                            client_write.write_all(frame.payload.as_ref()),
+                        )
+                        .await
+                        .context("relay timeout while writing to SOCKS client")??;
                     }
                     FrameType::TcpClose => break,
                     FrameType::ErrorFrame => {
@@ -120,7 +146,9 @@ impl TunnelClient {
                 }
             }
 
-            client_write.shutdown().await?;
+            timeout(RELAY_IDLE_TIMEOUT, client_write.shutdown())
+                .await
+                .context("relay timeout while shutting down SOCKS client writer")??;
             Ok::<u64, anyhow::Error>(transferred)
         };
 
@@ -313,14 +341,23 @@ impl TunnelClient {
     /// the local client connection and the returned `TunnelStream`.
     async fn open_tunnel(&self, target_host: &str, target_port: u16) -> Result<TunnelStream> {
         //connect to tunnel endpoint
-        let stream = TcpStream::connect((self.outbound.server.as_str(), self.outbound.port))
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to connect to tunnel endpoint {}:{}",
-                    self.outbound.server, self.outbound.port
-                )
-            })?;
+        let stream = timeout(
+            TUNNEL_ENDPOINT_CONNECT_TIMEOUT,
+            TcpStream::connect((self.outbound.server.as_str(), self.outbound.port)),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "timed out connecting to tunnel endpoint {}:{}",
+                self.outbound.server, self.outbound.port
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "failed to connect to tunnel endpoint {}:{}",
+                self.outbound.server, self.outbound.port
+            )
+        })?;
 
         //if tls is enabled, wrap the stream in tls
         let mut stream: TunnelStream = if self.outbound.tls {
@@ -333,15 +370,23 @@ impl TunnelClient {
                 .to_owned();
             let server_name = ServerName::try_from(server_name)
                 .map_err(|err| anyhow!("invalid tls server name: {err}"))?;
-            let tls_stream = connector
-                .connect(server_name, stream)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to establish tls connection to {}:{}",
-                        self.outbound.server, self.outbound.port
-                    )
-                })?;
+            let tls_stream = timeout(
+                TUNNEL_ENDPOINT_CONNECT_TIMEOUT,
+                connector.connect(server_name, stream),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "timed out establishing tls connection to {}:{}",
+                    self.outbound.server, self.outbound.port
+                )
+            })?
+            .with_context(|| {
+                format!(
+                    "failed to establish tls connection to {}:{}",
+                    self.outbound.server, self.outbound.port
+                )
+            })?;
             Box::new(tls_stream)
         } else {
             Box::new(stream)
@@ -385,7 +430,12 @@ impl TunnelClient {
         stream.write_all(request.as_bytes()).await?;
 
         //upgrade response
-        let response = read_http_headers(&mut stream).await?;
+        let response = timeout(
+            HTTP_UPGRADE_RESPONSE_TIMEOUT,
+            read_http_headers(&mut stream),
+        )
+        .await
+        .context("timed out waiting for HTTP upgrade response")??;
         let status = parse_status_code(&response).context("failed to parse tunnel response")?;
 
         if status != 101 {
@@ -407,7 +457,9 @@ impl TunnelClient {
         write_frame(&mut stream, FrameType::TcpConnect, STREAM_ID, 0, payload).await?;
 
         //read connect reply frame
-        let connect_reply = read_frame(&mut stream).await?;
+        let connect_reply = timeout(TCP_CONNECT_REPLY_TIMEOUT, read_frame(&mut stream))
+            .await
+            .context("timed out waiting for TCP_CONNECT reply")??;
         if connect_reply.stream_id != STREAM_ID {
             bail!(
                 "unexpected stream id in connect reply: {}",
@@ -503,6 +555,14 @@ async fn write_frame<W>(
 where
     W: AsyncWrite + Unpin + ?Sized,
 {
+    if payload.len() > MAX_FRAME_PAYLOAD_LEN {
+        bail!(
+            "frame payload too large: max={}, got={}",
+            MAX_FRAME_PAYLOAD_LEN,
+            payload.len()
+        );
+    }
+
     let frame = Frame {
         frame_type,
         stream_id,
@@ -521,6 +581,14 @@ where
     reader.read_exact(&mut header).await?;
 
     let payload_len = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
+    if payload_len > MAX_FRAME_PAYLOAD_LEN {
+        bail!(
+            "frame payload too large: max={}, got={}",
+            MAX_FRAME_PAYLOAD_LEN,
+            payload_len
+        );
+    }
+
     let mut raw = Vec::with_capacity(HEADER_LEN + payload_len);
     raw.extend_from_slice(&header);
 

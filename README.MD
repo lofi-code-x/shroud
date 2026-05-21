@@ -1,5 +1,47 @@
 # Проектирование собственного VLESS-like proxy/VPN протокола
 
+## TCP-only SOCKS5 tunnel smoke test
+
+Текущий стабильный режим - TCP CONNECT через локальный SOCKS5 inbound и HTTP/1.1 Upgrade tunnel transport. UDP relay пока не реализован.
+
+Сервер:
+
+```bash
+cargo run -p shroud-server -- configs/server.yaml
+```
+
+Ожидаемые логи:
+
+```text
+starting shroud server
+server listener started
+```
+
+Клиент:
+
+```bash
+cargo run -p shroud-client -- configs/client.yaml
+```
+
+Для проверки через SOCKS5 в `configs/client.yaml` должен быть включен `inbounds.socks.enabled: true`, а `inbounds.tun.enabled: false`.
+
+Ожидаемые логи:
+
+```text
+starting shroud client
+SOCKS5 inbound listener started
+```
+
+Проверка:
+
+```bash
+curl -v --socks5-hostname 127.0.0.1:1080 https://example.com/
+```
+
+При успешном TCP CONNECT в логах клиента будет `tunnel upgrade accepted`, затем `connection relay finished`. В логах сервера будет `tunnel relay finished`.
+
+Ограничение: поддерживается только SOCKS5 `CONNECT` для TCP. UDP associate / UDP relay не поддерживается.
+
 ## 1. Цель проекта
 
 Идея: реализовать собственный протокол по типу VLESS, где:
