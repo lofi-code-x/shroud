@@ -142,7 +142,7 @@ inbounds:
     address: "10.10.0.2/24"
     mtu: 1400
     auto_route: false
-    dns: "10.10.0.53"
+    dns: "127.0.0.1"
 
 outbound:
   server: "127.0.0.1"
@@ -322,12 +322,56 @@ inbounds:
     address: "10.10.0.2/24"
     mtu: 1400
     auto_route: false
-    dns: "10.10.0.53"
+    dns: "127.0.0.1"
 ```
 
 With `auto_route: false`, Shroud opens and configures the TUN interface, but system traffic will not automatically use it.
 
 With `auto_route: true`, Shroud attempts to move the default route through the TUN interface and adds loop-protection for the tunnel server endpoint. Use this only in controlled test environments until the TUN mode is more mature.
+
+### Fake DNS with TUN
+
+Fake DNS is started only when TUN mode is enabled. It listens on UDP port `53` at `inbounds.tun.dns`. If `dns` is omitted, the listener defaults to `127.0.0.1:53`.
+
+`inbounds.tun.dns` does not install DNS into the operating system. It only chooses the address Shroud binds for the Fake DNS listener. The system resolver must be pointed at that address manually while the client is running.
+
+Current Fake DNS behavior:
+
+- handles only UDP DNS `A` queries;
+- returns fake IPv4 addresses from `198.18.0.0/15`;
+- keeps an in-memory mapping from domain to fake IP;
+- when the TUN TCP stack later observes a connection to that fake IP, Shroud maps it back to the original domain and sends the domain through the tunnel;
+- if the destination IP was not allocated by Fake DNS, Shroud treats it as a plain IP target.
+
+Recommended local beta setup:
+
+```yaml
+inbounds:
+  tun:
+    enabled: true
+    name: "shroud0"
+    address: "10.10.0.2/24"
+    mtu: 1400
+    auto_route: true
+    dns: "127.0.0.1"
+```
+
+Then manually point the host resolver to `127.0.0.1` for the test session. The exact command depends on the Linux resolver stack. For `systemd-resolved`, one temporary per-link option is:
+
+```bash
+sudo resolvectl dns shroud0 127.0.0.1
+sudo resolvectl domain shroud0 '~.'
+```
+
+For systems that use `/etc/resolv.conf` directly, the equivalent test change is:
+
+```text
+nameserver 127.0.0.1
+```
+
+Restore the previous DNS settings after stopping Shroud. Shroud currently does not save, replace, or restore system DNS configuration.
+
+If you configure `inbounds.tun.dns` to a non-loopback address, that address must be local and bindable by the client process before the Fake DNS task starts. For example, using `10.10.0.53` requires you to arrange that address yourself; Shroud does not add it automatically. Binding to an address that is not present on the host can make the Fake DNS listener fail to start.
 
 Current TUN limitations:
 
