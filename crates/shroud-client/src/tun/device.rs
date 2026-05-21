@@ -39,6 +39,8 @@ mod platform {
     const DEV_NET_TUN: &str = "/dev/net/tun";
     const IFNAMSIZ: usize = 16;
     const IFF_TUN: c_short = 0x0001;
+    // Disable the extra 4-byte packet information header.
+    // With IFF_NO_PI, the TUN fd reads/writes pure IP packets.
     const IFF_NO_PI: c_short = 0x1000;
     const TUNSETIFF: c_ulong = 0x400454ca;
 

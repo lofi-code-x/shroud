@@ -178,12 +178,24 @@ pub fn setup_interface_only(tun_name: &str, tun: &TunInboundConfig) -> Result<()
     plan.apply_interface()
 }
 
-pub fn resolve_endpoint_ip(outbound: &OutboundConfig) -> Result<IpAddr> {
-    if let Ok(endpoint) = outbound.server.parse::<IpAddr>() {
-        return Ok(endpoint);
+pub struct ResolvedEndpoint {
+    pub ip: IpAddr,
+    pub original_host: String,
+    pub was_hostname: bool,
+}
+
+pub fn resolve_endpoint_ip(outbound: &OutboundConfig) -> Result<ResolvedEndpoint> {
+    let original_host = outbound.server.clone();
+
+    if let Ok(ip) = outbound.server.parse::<IpAddr>() {
+        return Ok(ResolvedEndpoint {
+            ip,
+            original_host,
+            was_hostname: false,
+        });
     }
 
-    (outbound.server.as_str(), outbound.port)
+    let ip = (outbound.server.as_str(), outbound.port)
         .to_socket_addrs()
         .with_context(|| {
             format!(
@@ -198,7 +210,31 @@ pub fn resolve_endpoint_ip(outbound: &OutboundConfig) -> Result<IpAddr> {
                 "bootstrap DNS returned no addresses for tunnel endpoint {}:{}",
                 outbound.server, outbound.port
             )
-        })
+        })?;
+
+    Ok(ResolvedEndpoint {
+        ip,
+        original_host,
+        was_hostname: true,
+    })
+}
+
+pub fn prepare_auto_route_outbound(mut outbound: OutboundConfig) -> Result<OutboundConfig> {
+    let endpoint = resolve_endpoint_ip(&outbound)?;
+
+    outbound.server = endpoint.ip.to_string();
+
+    if outbound.tls && outbound.tls_server_name.is_none() && endpoint.was_hostname {
+        outbound.tls_server_name = Some(endpoint.original_host.clone());
+    }
+
+    info!(
+        server = %endpoint.original_host,
+        endpoint_ip = %endpoint.ip,
+        "bootstrap-resolved tunnel endpoint before enabling TUN auto-route"
+    );
+
+    Ok(outbound)
 }
 
 pub fn resolve_endpoint_route(endpoint: IpAddr) -> Result<Option<EndpointRoute>> {
@@ -216,7 +252,7 @@ pub fn setup_before_packet_engine(
         Vec::new()
     };
     let endpoint_route = if tun.auto_route {
-        let endpoint = resolve_endpoint_ip(outbound)?;
+        let endpoint = resolve_endpoint_ip(outbound)?.ip;
         Some(resolve_endpoint_route(endpoint)?.with_context(|| {
             format!("failed to find current route to tunnel endpoint {endpoint}")
         })?)

@@ -36,19 +36,7 @@ async fn main() -> Result<()> {
 
     let mut outbound = cfg.outbound.clone();
     if cfg.inbounds.tun.enabled && cfg.inbounds.tun.auto_route {
-        if outbound.server.parse::<std::net::IpAddr>().is_err() {
-            let original_server = outbound.server.clone();
-            let endpoint_ip = tun::route::resolve_endpoint_ip(&outbound)?;
-            outbound.server = endpoint_ip.to_string();
-            if outbound.tls && outbound.tls_server_name.is_none() {
-                outbound.tls_server_name = Some(original_server.clone());
-            }
-            info!(
-                server = %original_server,
-                endpoint_ip = %endpoint_ip,
-                "bootstrap-resolved tunnel endpoint before enabling TUN auto-route"
-            );
-        }
+        outbound = tun::route::prepare_auto_route_outbound(outbound)?;
     }
 
     let router = routing::Router::try_new(cfg.routing.clone()).context("invalid routing config")?;
