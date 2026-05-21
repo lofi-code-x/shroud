@@ -161,186 +161,7 @@ impl TunnelClient {
         })
     }
 
-    /// Opens an outbound tunnel connection and requests a TCP connection to the target host.
-    ///
-    /// This function establishes a connection to the configured tunnel endpoint,
-    /// optionally wraps it in TLS, performs an HTTP `Upgrade` handshake, authenticates
-    /// the client using Shroud-specific headers, and then sends a `TcpConnect` frame
-    /// asking the tunnel server to connect to the requested destination.
-    ///
-    /// On success, the returned `TunnelStream` is an already-upgraded tunnel stream
-    /// ready for bidirectional proxied TCP traffic.
-    ///
-    /// # Protocol flow
-    ///
-    /// The function performs the following steps:
-    ///
-    /// 1. Opens a TCP connection to the configured outbound tunnel endpoint:
-    ///
-    /// ```text
-    /// self.outbound.server:self.outbound.port
-    /// ```
-    ///
-    /// 2. If TLS is enabled in the outbound configuration, upgrades the raw TCP stream
-    ///    to a TLS stream.
-    ///
-    /// 3. Builds authentication data:
-    ///
-    /// - current Unix timestamp;
-    /// - random UUID-based nonce;
-    /// - authentication tag computed from:
-    ///   - client secret;
-    ///   - nonce;
-    ///   - timestamp;
-    ///   - client ID.
-    ///
-    /// 4. Sends an HTTP/1.1 upgrade request:
-    ///
-    /// ```text
-    /// POST <path> HTTP/1.1
-    /// Host: <server>:<port>
-    /// Connection: Upgrade
-    /// Upgrade: shroud-tunnel
-    /// X-Shroud-Client-Id: <client_id>
-    /// X-Shroud-Timestamp: <timestamp>
-    /// X-Shroud-Nonce: <base64url_nonce>
-    /// X-Shroud-Auth: <auth_tag>
-    /// ```
-    ///
-    /// 5. Reads the HTTP response headers from the tunnel endpoint.
-    ///
-    /// 6. Verifies that the tunnel endpoint accepted the upgrade with:
-    ///
-    /// ```text
-    /// HTTP status 101 Switching Protocols
-    /// ```
-    ///
-    /// 7. Encodes the requested target address as a TCP connect payload.
-    ///
-    /// 8. Sends a `FrameType::TcpConnect` frame to the tunnel server.
-    ///
-    /// 9. Waits for a connect reply frame from the server.
-    ///
-    /// 10. Returns the upgraded tunnel stream if the server confirms the TCP connect
-    ///     request with the `CONNECT_OK_FLAG`.
-    ///
-    /// # Arguments
-    ///
-    /// * `target_host` - Destination host that the tunnel server should connect to.
-    ///   This may be a domain name, IPv4 address, or IPv6 address depending on what
-    ///   `encode_tcp_connect_payload` supports.
-    ///
-    /// * `target_port` - Destination TCP port that the tunnel server should connect to.
-    ///
-    /// # Returns
-    ///
-    /// Returns a `TunnelStream` if:
-    ///
-    /// - the connection to the tunnel endpoint succeeds;
-    /// - optional TLS negotiation succeeds;
-    /// - the HTTP upgrade request is accepted with status `101`;
-    /// - the `TcpConnect` frame is accepted by the tunnel server;
-    /// - the server replies with a successful connect response.
-    ///
-    /// The returned stream is already upgraded from HTTP mode into the custom
-    /// tunnel framing protocol and can be used for further frame-based data exchange.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    ///
-    /// - connecting to the tunnel endpoint fails;
-    /// - TLS configuration cannot be built;
-    /// - TLS server name is invalid;
-    /// - TLS negotiation fails;
-    /// - the system clock is before the Unix epoch;
-    /// - authentication tag generation fails;
-    /// - writing the HTTP upgrade request fails;
-    /// - reading the HTTP response headers fails;
-    /// - the HTTP response status cannot be parsed;
-    /// - the tunnel endpoint rejects the upgrade with a status other than `101`;
-    /// - encoding the TCP connect payload fails;
-    /// - writing the `TcpConnect` frame fails;
-    /// - reading the connect reply frame fails;
-    /// - the reply uses an unexpected stream ID;
-    /// - the server returns an error frame;
-    /// - the server returns a `TcpConnect` frame without the success flag;
-    /// - the server returns an unexpected frame type.
-    ///
-    /// # Authentication
-    ///
-    /// The upgrade request contains Shroud-specific authentication headers:
-    ///
-    /// ```text
-    /// X-Shroud-Client-Id
-    /// X-Shroud-Timestamp
-    /// X-Shroud-Nonce
-    /// X-Shroud-Auth
-    /// ```
-    ///
-    /// The nonce is generated from a random UUID and encoded using base64 without
-    /// padding. The authentication tag is computed from the client secret, nonce,
-    /// timestamp, and client ID.
-    ///
-    /// This allows the server to verify that the client knows the shared secret and
-    /// helps protect the upgrade request against simple replay attacks, assuming the
-    /// server validates timestamp freshness and nonce uniqueness.
-    ///
-    /// # TLS behavior
-    ///
-    /// If `self.outbound.tls` is `true`, the function wraps the TCP connection with
-    /// TLS before sending the HTTP upgrade request.
-    ///
-    /// The TLS server name is selected as follows:
-    ///
-    /// 1. `self.outbound.tls_server_name`, if explicitly configured.
-    /// 2. `self.outbound.server`, otherwise.
-    ///
-    /// If `self.outbound.tls` is `false`, the HTTP upgrade request is sent directly
-    /// over the raw TCP stream.
-    ///
-    /// # HTTP upgrade behavior
-    ///
-    /// The function expects the tunnel endpoint to accept the upgrade by returning
-    /// HTTP status code `101`.
-    ///
-    /// Any other status code is treated as rejection:
-    ///
-    /// ```text
-    /// tunnel endpoint rejected upgrade with HTTP status <status>
-    /// ```
-    ///
-    /// After status `101`, the stream is no longer treated as normal HTTP. It is
-    /// expected to switch into the custom Shroud tunnel framing protocol.
-    ///
-    /// # Frame behavior
-    ///
-    /// After the HTTP upgrade succeeds, the function sends a `TcpConnect` frame:
-    ///
-    /// ```text
-    /// FrameType::TcpConnect
-    /// stream_id = STREAM_ID
-    /// flags     = 0
-    /// payload   = encoded target_host + target_port
-    /// ```
-    ///
-    /// Then it reads a reply frame and validates:
-    ///
-    /// - the reply belongs to the same `STREAM_ID`;
-    /// - the frame type is `FrameType::TcpConnect`;
-    /// - the reply has `CONNECT_OK_FLAG` set.
-    ///
-    /// If the server returns `FrameType::ErrorFrame`, the payload is interpreted as
-    /// a UTF-8-lossy error message and returned as part of the error.
-    ///
-    /// # Notes
-    ///
-    /// This function does not itself proxy application data. It only establishes
-    /// the tunnel and asks the server to open the remote TCP connection. After it
-    /// returns successfully, the caller is responsible for forwarding data between
-    /// the local client connection and the returned `TunnelStream`.
     async fn open_tunnel(&self, target_host: &str, target_port: u16) -> Result<TunnelStream> {
-        //connect to tunnel endpoint
         let stream = timeout(
             TUNNEL_ENDPOINT_CONNECT_TIMEOUT,
             TcpStream::connect((self.outbound.server.as_str(), self.outbound.port)),
@@ -359,7 +180,6 @@ impl TunnelClient {
             )
         })?;
 
-        //if tls is enabled, wrap the stream in tls
         let mut stream: TunnelStream = if self.outbound.tls {
             let connector = TlsConnector::from(Arc::new(build_tls_client_config(&self.outbound)?));
             let server_name = self
@@ -398,7 +218,6 @@ impl TunnelClient {
             .as_secs() as i64;
 
         let nonce = uuid::Uuid::new_v4().as_bytes().to_vec();
-        //hmac-sha256(client_secret, nonce, timestamp, client_id)
         let auth_tag = compute_auth_tag(
             self.auth.client_secret.as_bytes(),
             &nonce,
@@ -407,16 +226,6 @@ impl TunnelClient {
         )
         .context("failed to compute auth tag")?;
 
-        //http upgrade request
-        //example:
-        //POST /tunnel HTTP/1.1
-        // Host: example.com:443
-        // Connection: Upgrade
-        // Upgrade: shroud-tunnel
-        // X-Shroud-Client-Id: client-1
-        // X-Shroud-Timestamp: 1716040000
-        // X-Shroud-Nonce: 1LqY2MZtQ7m1...
-        // X-Shroud-Auth: calculated-auth-tag
         let request = format!(
             "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: Upgrade\r\nUpgrade: shroud-tunnel\r\nX-Shroud-Client-Id: {client_id}\r\nX-Shroud-Timestamp: {timestamp}\r\nX-Shroud-Nonce: {nonce}\r\nX-Shroud-Auth: {auth}\r\n\r\n",
             path = self.outbound.path,
@@ -429,7 +238,6 @@ impl TunnelClient {
         );
         stream.write_all(request.as_bytes()).await?;
 
-        //upgrade response
         let response = timeout(
             HTTP_UPGRADE_RESPONSE_TIMEOUT,
             read_http_headers(&mut stream),
@@ -451,12 +259,10 @@ impl TunnelClient {
             "tunnel upgrade accepted"
         );
 
-        //send tcp connect frame
         let payload = encode_tcp_connect_payload(target_host, target_port)
             .map_err(|err| anyhow!("failed to encode tcp connect payload: {err}"))?;
         write_frame(&mut stream, FrameType::TcpConnect, STREAM_ID, 0, payload).await?;
 
-        //read connect reply frame
         let connect_reply = timeout(TCP_CONNECT_REPLY_TIMEOUT, read_frame(&mut stream))
             .await
             .context("timed out waiting for TCP_CONNECT reply")??;
