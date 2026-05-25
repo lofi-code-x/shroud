@@ -1,0 +1,19 @@
+services:
+  shroud-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: shroud-server:local
+    container_name: shroud-server
+    command: ["configs/server.yaml"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-debug}
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./configs/server.yaml:/app/configs/server.yaml:ro
+      - ./certs:/app/certs:ro
+      - ./web:/app/web:ro
+    stop_signal: SIGINT
+    stop_grace_period: 10s
+    restart: unless-stopped

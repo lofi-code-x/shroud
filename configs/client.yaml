@@ -20,8 +20,8 @@ outbound:
   tls_ca_cert_path: "certs/ca.crt"
 
 auth:
-  client_id: "11111111-1111-1111-1111-111111111111"
-  client_secret: "replace-with-random-secret"
+  client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
+  client_secret: "8ow8KFQbQ9KOuzhBxVnyROUaOMJx2km2jK4qjS7jVSM"
 
 dns:
   remote_by_default: true

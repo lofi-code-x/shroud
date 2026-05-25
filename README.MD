@@ -223,6 +223,22 @@ Start the server:
 cargo run -p shroud-server -- configs/server.yaml
 ```
 
+Start the server with Docker Compose:
+
+```bash
+docker compose up --build shroud-server
+```
+
+The compose service mounts these host paths read-only into the container:
+
+- `configs/server.yaml` -> `/app/configs/server.yaml`;
+- `certs/` -> `/app/certs/`;
+- `web/` -> `/app/web/`.
+
+The default server config uses relative paths under `/app`, so `tls.cert_path: "certs/localhost.crt"`,
+`tls.key_path: "certs/localhost.key"` and `web_root: "./web"` work unchanged in the container.
+Generate or copy the TLS files described in `certs/README.md` before starting the service.
+
 Start the client:
 
 ```bash

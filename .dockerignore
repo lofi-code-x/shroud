@@ -1,0 +1,9 @@
+target/
+.git/
+.idea/
+.agents/
+.codex/
+certs/*
+!certs/.gitignore
+!certs/README.md
+**/*.rs.bk
