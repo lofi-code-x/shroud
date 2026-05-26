@@ -18,6 +18,7 @@ outbound:
   tls: true
   tls_server_name: "localhost"
   tls_ca_cert_path: "certs/ca.crt"
+  multiplex: true
 
 auth:
   client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"

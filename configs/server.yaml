@@ -8,3 +8,5 @@ tls:
 clients:
   - client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"
     client_secret: "8ow8KFQbQ9KOuzhBxVnyROUaOMJx2km2jK4qjS7jVSM"
+multiplex:
+  enabled: true

@@ -1,5 +1,5 @@
 use crate::auth::validate_auth;
-use crate::relay::relay_tunnel;
+use crate::relay::{relay_multiplexed_tunnel, relay_tunnel};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -37,6 +37,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     info!(
         listen = %cfg.listen,
         tls = cfg.tls.enabled,
+        multiplex = cfg.multiplex.enabled,
         "server listener started"
     );
 
@@ -232,7 +233,11 @@ where
         http_upgrade_ms = elapsed_millis(http_upgrade_started.elapsed()),
         "server HTTP upgrade accepted"
     );
-    relay_tunnel(stream, peer).await?;
+    if cfg.multiplex.enabled {
+        relay_multiplexed_tunnel(stream, peer).await?;
+    } else {
+        relay_tunnel(stream, peer).await?;
+    }
     Ok(())
 }
 
@@ -899,6 +904,7 @@ mod tests {
             tunnel_path: "/api/tunnel".to_string(),
             web_root: web_root.path.to_string_lossy().into_owned(),
             tls: ServerTlsConfig::default(),
+            multiplex: Default::default(),
             clients: vec![AuthorizedClient {
                 client_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_secret: "test-secret".to_string(),

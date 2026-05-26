@@ -5,9 +5,8 @@ use bytes::Bytes;
 use shroud_core::auth::compute_auth_tag;
 use shroud_core::config::{ClientAuthConfig, OutboundConfig};
 use shroud_core::protocol::{
-    Frame, FrameType, HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, UdpDatagram,
-    decode_udp_associate_response_payload, decode_udp_datagram, encode_tcp_connect_payload,
-    encode_udp_datagram,
+    FrameType, UdpDatagram, decode_udp_associate_response_payload, decode_udp_datagram,
+    encode_tcp_connect_payload, encode_udp_datagram, read_frame, write_frame,
 };
 use std::fs::File;
 use std::io::BufReader;
@@ -401,6 +400,14 @@ impl TunnelClient {
         }
     }
 
+    pub(crate) async fn open_persistent_tunnel_transport(&self) -> Result<TunnelStream> {
+        Ok(self
+            .open_tunnel_transport("<multiplex>", 0)
+            .await
+            .context("failed to open persistent tunnel transport")?
+            .stream)
+    }
+
     async fn open_tunnel_transport(
         &self,
         target_host: &str,
@@ -607,60 +614,4 @@ fn parse_status_code(raw_headers: &[u8]) -> Result<u16> {
         .ok_or_else(|| anyhow!("missing HTTP status code in response"))?;
     code.parse::<u16>()
         .context("HTTP status code is not a valid integer")
-}
-
-async fn write_frame<W>(
-    writer: &mut W,
-    frame_type: FrameType,
-    stream_id: u64,
-    flags: u16,
-    payload: Bytes,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin + ?Sized,
-{
-    if payload.len() > MAX_FRAME_PAYLOAD_LEN {
-        bail!(
-            "frame payload too large: max={}, got={}",
-            MAX_FRAME_PAYLOAD_LEN,
-            payload.len()
-        );
-    }
-
-    let frame = Frame {
-        frame_type,
-        stream_id,
-        flags,
-        payload,
-    };
-    writer.write_all(frame.encode().as_ref()).await?;
-    Ok(())
-}
-
-async fn read_frame<R>(reader: &mut R) -> Result<Frame>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let mut header = [0u8; HEADER_LEN];
-    reader.read_exact(&mut header).await?;
-
-    let payload_len = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
-    if payload_len > MAX_FRAME_PAYLOAD_LEN {
-        bail!(
-            "frame payload too large: max={}, got={}",
-            MAX_FRAME_PAYLOAD_LEN,
-            payload_len
-        );
-    }
-
-    let mut raw = Vec::with_capacity(HEADER_LEN + payload_len);
-    raw.extend_from_slice(&header);
-
-    if payload_len > 0 {
-        let mut payload = vec![0u8; payload_len];
-        reader.read_exact(&mut payload).await?;
-        raw.extend_from_slice(&payload);
-    }
-
-    Frame::decode(Bytes::from(raw)).map_err(|err| anyhow!("failed to decode frame: {err}"))
 }

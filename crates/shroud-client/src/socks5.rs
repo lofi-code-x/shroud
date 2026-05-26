@@ -110,7 +110,7 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let mut outbound = match session.open_tcp(target_host, target_port).await {
+    let outbound = match session.open_tcp(target_host, target_port).await {
         Ok(TcpOpenResult::Opened(outbound)) => outbound,
         Ok(TcpOpenResult::Blocked) => {
             write_reply(&mut socket, ReplyCode::ConnectionNotAllowed).await?;
@@ -128,7 +128,7 @@ async fn handle_connection(
     let metrics = outbound.metrics;
     let relay_started = Instant::now();
     let stats = session
-        .relay_tcp(&mut socket, &mut outbound)
+        .relay_tcp(&mut socket, outbound)
         .await
         .with_context(|| format!("relay failed for {target_host}:{target_port}"))?;
     let relay_elapsed = relay_started.elapsed();

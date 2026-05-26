@@ -178,11 +178,11 @@ async fn handle_tcp_stream(
     );
 
     match session.open_tcp(&target_host, target_port).await? {
-        TcpOpenResult::Opened(mut outbound) => {
+        TcpOpenResult::Opened(outbound) => {
             let action = outbound.action;
             let metrics = outbound.metrics;
             let relay_started = Instant::now();
-            let stats = session.relay_tcp(&mut stream, &mut outbound).await?;
+            let stats = session.relay_tcp(&mut stream, outbound).await?;
             let relay_elapsed = relay_started.elapsed();
             let total_bytes = stats.total_bytes();
             let mbps = stats.mbps(relay_elapsed);

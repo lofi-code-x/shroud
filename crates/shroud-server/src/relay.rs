@@ -1,21 +1,698 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use shroud_core::protocol::{
-    Frame, FrameType, HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, UdpDatagram, decode_tcp_connect_payload,
-    decode_udp_datagram, encode_udp_associate_response_payload, encode_udp_datagram,
+    Frame, FrameCommand, FrameType, MAX_FRAME_PAYLOAD_LEN, ProtocolError, UdpDatagram,
+    decode_tcp_connect_payload, decode_udp_datagram, encode_udp_associate_response_payload,
+    encode_udp_datagram, read_frame, write_frame,
 };
+use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 const CONNECT_OK_FLAG: u16 = 0x0001;
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const WRITER_CHANNEL_CAPACITY: usize = 128;
+const STREAM_CHANNEL_CAPACITY: usize = 128;
+const WRITER_CHANNEL_SEND_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(1);
+
+type TargetStreamTx = mpsc::Sender<Bytes>;
+
+struct ServerTunnelState {
+    streams: Mutex<HashMap<u64, TargetStreamTx>>,
+    writer_tx: mpsc::Sender<FrameCommand>,
+    tunnel_closed: AtomicBool,
+}
+
+pub async fn relay_multiplexed_tunnel<S>(tunnel_stream: S, peer: SocketAddr) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let opened_at = Instant::now();
+    let (read_half, write_half) = tokio::io::split(tunnel_stream);
+    let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
+    let state = Arc::new(ServerTunnelState {
+        streams: Mutex::new(HashMap::new()),
+        writer_tx,
+        tunnel_closed: AtomicBool::new(false),
+    });
+
+    info!(%peer, "multiplexed physical tunnel opened");
+
+    let writer_task = tokio::spawn(server_tunnel_writer_loop(write_half, writer_rx));
+    let result = server_tunnel_reader_loop(read_half, Arc::clone(&state), peer).await;
+
+    state.tunnel_closed.store(true, Ordering::Release);
+    let active_streams = clear_multiplexed_streams(&state).await;
+    writer_task.abort();
+    let _ = writer_task.await;
+
+    match &result {
+        Ok(()) => info!(
+            %peer,
+            duration_ms = elapsed_millis(opened_at.elapsed()),
+            active_streams,
+            "multiplexed physical tunnel closed"
+        ),
+        Err(err) => warn!(
+            %peer,
+            duration_ms = elapsed_millis(opened_at.elapsed()),
+            active_streams,
+            error = %err,
+            "multiplexed physical tunnel closed with error"
+        ),
+    }
+
+    result
+}
+
+async fn server_tunnel_reader_loop<R>(
+    mut read_half: tokio::io::ReadHalf<R>,
+    state: Arc<ServerTunnelState>,
+    peer: SocketAddr,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let frame = match timeout(RELAY_IDLE_TIMEOUT, read_frame(&mut read_half)).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(ProtocolError::Io(err))) if err.kind() == ErrorKind::UnexpectedEof => {
+                debug!(%peer, "multiplexed tunnel peer closed connection");
+                return Ok(());
+            }
+            Ok(Err(err)) => return Err(anyhow!("failed to read multiplexed tunnel frame: {err}")),
+            Err(_) => bail!("multiplexed tunnel idle timeout while reading from peer {peer}"),
+        };
+
+        match frame.frame_type {
+            FrameType::TcpConnect => {
+                let (target_host, target_port) = decode_tcp_connect_payload(frame.payload.as_ref())
+                    .map_err(|err| anyhow!("invalid TCP_CONNECT payload: {err}"))?;
+                handle_multiplexed_tcp_connect(
+                    Arc::clone(&state),
+                    peer,
+                    frame.stream_id,
+                    target_host,
+                    target_port,
+                )
+                .await?;
+            }
+            FrameType::TcpData => {
+                dispatch_tcp_data_to_target(Arc::clone(&state), peer, frame).await?;
+            }
+            FrameType::TcpClose => {
+                let active_streams = remove_multiplexed_stream(&state, frame.stream_id).await;
+                debug!(
+                    %peer,
+                    stream_id = frame.stream_id,
+                    active_streams,
+                    "multiplexed TCP stream closed by peer"
+                );
+            }
+            FrameType::ErrorFrame => {
+                let message = String::from_utf8_lossy(frame.payload.as_ref()).into_owned();
+                let active_streams = remove_multiplexed_stream(&state, frame.stream_id).await;
+                debug!(
+                    %peer,
+                    stream_id = frame.stream_id,
+                    active_streams,
+                    error = %message,
+                    "multiplexed TCP stream failed by peer"
+                );
+            }
+            FrameType::Ping => {
+                send_writer_command(
+                    &state.writer_tx,
+                    FrameCommand {
+                        frame_type: FrameType::Pong,
+                        stream_id: frame.stream_id,
+                        flags: 0,
+                        payload: frame.payload,
+                    },
+                    "PONG",
+                )
+                .await
+                .context("failed to queue PONG for multiplexed tunnel")?;
+            }
+            other => {
+                debug!(
+                    %peer,
+                    stream_id = frame.stream_id,
+                    frame_type = %other,
+                    "ignoring unsupported frame on multiplexed tunnel"
+                );
+            }
+        }
+    }
+}
+
+async fn server_tunnel_writer_loop<W>(
+    mut write_half: tokio::io::WriteHalf<W>,
+    mut rx: mpsc::Receiver<FrameCommand>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(cmd) = rx.recv().await {
+        if let Err(err) = write_frame(
+            &mut write_half,
+            cmd.frame_type,
+            cmd.stream_id,
+            cmd.flags,
+            cmd.payload,
+        )
+        .await
+        {
+            warn!(error = %err, "multiplexed tunnel writer stopped");
+            break;
+        }
+    }
+
+    debug!("multiplexed tunnel writer finished");
+}
+
+async fn handle_multiplexed_tcp_connect(
+    state: Arc<ServerTunnelState>,
+    peer: SocketAddr,
+    stream_id: u64,
+    target_host: String,
+    target_port: u16,
+) -> Result<()> {
+    let (to_target_tx, to_target_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+
+    {
+        let mut streams = state.streams.lock().await;
+        if streams.contains_key(&stream_id) {
+            drop(streams);
+            send_writer_command(
+                &state.writer_tx,
+                FrameCommand {
+                    frame_type: FrameType::ErrorFrame,
+                    stream_id,
+                    flags: 0,
+                    payload: Bytes::from_static(b"duplicate stream id"),
+                },
+                "duplicate stream id ERROR",
+            )
+            .await
+            .context("failed to queue duplicate stream id error")?;
+            return Ok(());
+        }
+
+        streams.insert(stream_id, to_target_tx);
+        debug!(
+            %peer,
+            stream_id,
+            target_host,
+            target_port,
+            active_streams = streams.len(),
+            "multiplexed TCP stream opened"
+        );
+    }
+
+    tokio::spawn(connect_and_relay_target(
+        state,
+        peer,
+        stream_id,
+        target_host,
+        target_port,
+        to_target_rx,
+    ));
+
+    Ok(())
+}
+
+async fn dispatch_tcp_data_to_target(
+    state: Arc<ServerTunnelState>,
+    peer: SocketAddr,
+    frame: Frame,
+) -> Result<()> {
+    let tx = {
+        let streams = state.streams.lock().await;
+        streams.get(&frame.stream_id).cloned()
+    };
+
+    let Some(tx) = tx else {
+        debug!(
+            %peer,
+            stream_id = frame.stream_id,
+            "dropping TCP_DATA for unknown multiplexed stream"
+        );
+        return Ok(());
+    };
+
+    if tx.send(frame.payload).await.is_err() {
+        let active_streams = remove_multiplexed_stream(&state, frame.stream_id).await;
+        debug!(
+            %peer,
+            stream_id = frame.stream_id,
+            active_streams,
+            "multiplexed TCP stream removed after target input closed"
+        );
+    }
+
+    Ok(())
+}
+
+async fn connect_and_relay_target(
+    state: Arc<ServerTunnelState>,
+    peer: SocketAddr,
+    stream_id: u64,
+    target_host: String,
+    target_port: u16,
+    to_target_rx: mpsc::Receiver<Bytes>,
+) {
+    let opened_at = Instant::now();
+    let tunnel_to_target_bytes = Arc::new(AtomicU64::new(0));
+    let target_to_tunnel_bytes = Arc::new(AtomicU64::new(0));
+    let target_connect_started = Instant::now();
+    let target_stream = match timeout(
+        TARGET_CONNECT_TIMEOUT,
+        TcpStream::connect((target_host.as_str(), target_port)),
+    )
+    .await
+    {
+        Err(_) => {
+            let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
+            let message = format!("timed out connecting target {target_host}:{target_port}");
+            debug!(
+                %peer,
+                stream_id,
+                target_host,
+                target_port,
+                target_tcp_connect_ms,
+                "multiplexed target TCP connect timed out"
+            );
+            fail_multiplexed_stream(&state, stream_id, message).await;
+            log_multiplexed_stream_closed(
+                peer,
+                stream_id,
+                &target_host,
+                target_port,
+                opened_at,
+                tunnel_to_target_bytes.load(Ordering::Relaxed),
+                target_to_tunnel_bytes.load(Ordering::Relaxed),
+                active_multiplexed_streams(&state).await,
+            );
+            return;
+        }
+        Ok(Ok(stream)) => {
+            let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
+            if let Err(err) = stream.set_nodelay(true) {
+                let message = format!(
+                    "failed to enable TCP_NODELAY for target connection {target_host}:{target_port}: {err}"
+                );
+                fail_multiplexed_stream(&state, stream_id, message).await;
+                log_multiplexed_stream_closed(
+                    peer,
+                    stream_id,
+                    &target_host,
+                    target_port,
+                    opened_at,
+                    tunnel_to_target_bytes.load(Ordering::Relaxed),
+                    target_to_tunnel_bytes.load(Ordering::Relaxed),
+                    active_multiplexed_streams(&state).await,
+                );
+                return;
+            }
+
+            debug!(
+                %peer,
+                stream_id,
+                target_host,
+                target_port,
+                target_tcp_connect_ms,
+                "multiplexed target TCP connect finished"
+            );
+
+            stream
+        }
+        Ok(Err(err)) => {
+            let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
+            let message = format!("failed to connect target {target_host}:{target_port}: {err}");
+            debug!(
+                %peer,
+                stream_id,
+                target_host,
+                target_port,
+                target_tcp_connect_ms,
+                error = %err,
+                "multiplexed target TCP connect failed"
+            );
+            fail_multiplexed_stream(&state, stream_id, message).await;
+            log_multiplexed_stream_closed(
+                peer,
+                stream_id,
+                &target_host,
+                target_port,
+                opened_at,
+                tunnel_to_target_bytes.load(Ordering::Relaxed),
+                target_to_tunnel_bytes.load(Ordering::Relaxed),
+                active_multiplexed_streams(&state).await,
+            );
+            return;
+        }
+    };
+
+    if !is_multiplexed_stream_active(&state, stream_id).await {
+        debug!(
+            %peer,
+            stream_id,
+            target_host,
+            target_port,
+            "multiplexed stream closed before target connect response"
+        );
+        log_multiplexed_stream_closed(
+            peer,
+            stream_id,
+            &target_host,
+            target_port,
+            opened_at,
+            tunnel_to_target_bytes.load(Ordering::Relaxed),
+            target_to_tunnel_bytes.load(Ordering::Relaxed),
+            active_multiplexed_streams(&state).await,
+        );
+        return;
+    }
+
+    if send_writer_command(
+        &state.writer_tx,
+        FrameCommand {
+            frame_type: FrameType::TcpConnect,
+            stream_id,
+            flags: CONNECT_OK_FLAG,
+            payload: Bytes::new(),
+        },
+        "TCP_CONNECT response",
+    )
+    .await
+    .is_err()
+    {
+        remove_multiplexed_stream(&state, stream_id).await;
+        log_multiplexed_stream_closed(
+            peer,
+            stream_id,
+            &target_host,
+            target_port,
+            opened_at,
+            tunnel_to_target_bytes.load(Ordering::Relaxed),
+            target_to_tunnel_bytes.load(Ordering::Relaxed),
+            active_multiplexed_streams(&state).await,
+        );
+        return;
+    }
+
+    let (target_read, target_write) = target_stream.into_split();
+    let writer_tx = state.writer_tx.clone();
+    let mut reader_task = tokio::spawn(target_reader_loop(
+        stream_id,
+        target_read,
+        writer_tx,
+        Arc::clone(&target_to_tunnel_bytes),
+    ));
+    let mut writer_task = tokio::spawn(target_writer_loop(
+        stream_id,
+        target_write,
+        to_target_rx,
+        Arc::clone(&tunnel_to_target_bytes),
+    ));
+
+    tokio::select! {
+        result = &mut reader_task => {
+            match result {
+                Ok(Ok(bytes)) => debug!(
+                    %peer,
+                    stream_id,
+                    target_host,
+                    target_port,
+                    target_to_tunnel_bytes = bytes,
+                    "multiplexed target reader finished"
+                ),
+                Ok(Err(err)) => debug!(
+                    %peer,
+                    stream_id,
+                    target_host,
+                    target_port,
+                    error = %err,
+                    "multiplexed target reader failed"
+                ),
+                Err(err) => debug!(
+                    %peer,
+                    stream_id,
+                    target_host,
+                    target_port,
+                    error = %err,
+                    "multiplexed target reader task failed"
+                ),
+            }
+            remove_multiplexed_stream(&state, stream_id).await;
+            let _ = send_writer_command(&state.writer_tx, FrameCommand {
+                frame_type: FrameType::TcpClose,
+                stream_id,
+                flags: 0,
+                payload: Bytes::new(),
+            }, "TCP_CLOSE").await;
+            writer_task.abort();
+            let _ = writer_task.await;
+        }
+        result = &mut writer_task => {
+            let writer_finished_cleanly = matches!(result, Ok(Ok(_)));
+            match result {
+                Ok(Ok(bytes)) => debug!(
+                    %peer,
+                    stream_id,
+                    target_host,
+                    target_port,
+                    tunnel_to_target_bytes = bytes,
+                    "multiplexed target writer finished"
+                ),
+                Ok(Err(err)) => debug!(
+                    %peer,
+                    stream_id,
+                    target_host,
+                    target_port,
+                    error = %err,
+                    "multiplexed target writer failed"
+                ),
+                Err(err) => debug!(
+                    %peer,
+                    stream_id,
+                    target_host,
+                    target_port,
+                    error = %err,
+                    "multiplexed target writer task failed"
+                ),
+            }
+
+            if writer_finished_cleanly && !state.tunnel_closed.load(Ordering::Acquire) {
+                match reader_task.await {
+                    Ok(Ok(bytes)) => debug!(
+                        %peer,
+                        stream_id,
+                        target_host,
+                        target_port,
+                        target_to_tunnel_bytes = bytes,
+                        "multiplexed target reader finished after input close"
+                    ),
+                    Ok(Err(err)) => debug!(
+                        %peer,
+                        stream_id,
+                        target_host,
+                        target_port,
+                        error = %err,
+                        "multiplexed target reader failed after input close"
+                    ),
+                    Err(err) => debug!(
+                        %peer,
+                        stream_id,
+                        target_host,
+                        target_port,
+                        error = %err,
+                        "multiplexed target reader task failed after input close"
+                    ),
+                }
+                remove_multiplexed_stream(&state, stream_id).await;
+                let _ = send_writer_command(&state.writer_tx, FrameCommand {
+                    frame_type: FrameType::TcpClose,
+                    stream_id,
+                    flags: 0,
+                    payload: Bytes::new(),
+                }, "TCP_CLOSE").await;
+            } else {
+                remove_multiplexed_stream(&state, stream_id).await;
+                reader_task.abort();
+                let _ = reader_task.await;
+            }
+        }
+    }
+
+    log_multiplexed_stream_closed(
+        peer,
+        stream_id,
+        &target_host,
+        target_port,
+        opened_at,
+        tunnel_to_target_bytes.load(Ordering::Relaxed),
+        target_to_tunnel_bytes.load(Ordering::Relaxed),
+        active_multiplexed_streams(&state).await,
+    );
+}
+
+async fn target_reader_loop(
+    stream_id: u64,
+    mut target_read: impl AsyncRead + Unpin,
+    writer_tx: mpsc::Sender<FrameCommand>,
+    transferred_counter: Arc<AtomicU64>,
+) -> Result<u64> {
+    let mut transferred = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+
+    loop {
+        let n = timeout(RELAY_IDLE_TIMEOUT, target_read.read(&mut buf))
+            .await
+            .map_err(|_| anyhow!("relay idle timeout while reading from target"))??;
+        if n == 0 {
+            break;
+        }
+
+        transferred += n as u64;
+        transferred_counter.store(transferred, Ordering::Relaxed);
+        send_writer_command(
+            &writer_tx,
+            FrameCommand {
+                frame_type: FrameType::TcpData,
+                stream_id,
+                flags: 0,
+                payload: Bytes::copy_from_slice(&buf[..n]),
+            },
+            "TCP_DATA",
+        )
+        .await
+        .context("failed to queue TCP_DATA from target")?;
+    }
+
+    Ok(transferred)
+}
+
+async fn target_writer_loop(
+    _stream_id: u64,
+    mut target_write: impl AsyncWrite + Unpin,
+    mut rx: mpsc::Receiver<Bytes>,
+    transferred_counter: Arc<AtomicU64>,
+) -> Result<u64> {
+    let mut transferred = 0u64;
+
+    while let Some(bytes) = rx.recv().await {
+        transferred += bytes.len() as u64;
+        transferred_counter.store(transferred, Ordering::Relaxed);
+        timeout(RELAY_IDLE_TIMEOUT, target_write.write_all(bytes.as_ref()))
+            .await
+            .map_err(|_| anyhow!("relay timeout while writing to target"))??;
+    }
+
+    timeout(RELAY_IDLE_TIMEOUT, target_write.shutdown())
+        .await
+        .map_err(|_| anyhow!("relay timeout while shutting down target writer"))??;
+    Ok(transferred)
+}
+
+async fn fail_multiplexed_stream(state: &Arc<ServerTunnelState>, stream_id: u64, message: String) {
+    remove_multiplexed_stream(state, stream_id).await;
+    let _ = send_writer_command(
+        &state.writer_tx,
+        FrameCommand {
+            frame_type: FrameType::ErrorFrame,
+            stream_id,
+            flags: 0,
+            payload: Bytes::from(message),
+        },
+        "ERROR",
+    )
+    .await;
+}
+
+async fn remove_multiplexed_stream(state: &Arc<ServerTunnelState>, stream_id: u64) -> usize {
+    let mut streams = state.streams.lock().await;
+    streams.remove(&stream_id);
+    streams.len()
+}
+
+async fn is_multiplexed_stream_active(state: &Arc<ServerTunnelState>, stream_id: u64) -> bool {
+    state.streams.lock().await.contains_key(&stream_id)
+}
+
+async fn active_multiplexed_streams(state: &Arc<ServerTunnelState>) -> usize {
+    state.streams.lock().await.len()
+}
+
+async fn clear_multiplexed_streams(state: &Arc<ServerTunnelState>) -> usize {
+    let mut streams = state.streams.lock().await;
+    let active_streams = streams.len();
+    streams.clear();
+    active_streams
+}
+
+async fn send_writer_command(
+    writer_tx: &mpsc::Sender<FrameCommand>,
+    cmd: FrameCommand,
+    operation: &'static str,
+) -> Result<()> {
+    let frame_type = cmd.frame_type;
+    let stream_id = cmd.stream_id;
+    let payload_len = cmd.payload.len();
+    let started = Instant::now();
+
+    writer_tx
+        .send(cmd)
+        .await
+        .with_context(|| format!("failed to queue {operation} for multiplexed tunnel"))?;
+
+    let wait = started.elapsed();
+    if wait >= WRITER_CHANNEL_SEND_WAIT_LOG_THRESHOLD {
+        debug!(
+            stream_id,
+            frame_type = %frame_type,
+            payload_len,
+            writer_channel_send_wait_ms = elapsed_millis(wait),
+            "multiplexed tunnel writer channel send waited"
+        );
+    }
+
+    Ok(())
+}
+
+fn log_multiplexed_stream_closed(
+    peer: SocketAddr,
+    stream_id: u64,
+    target_host: &str,
+    target_port: u16,
+    opened_at: Instant,
+    bytes_up: u64,
+    bytes_down: u64,
+    active_streams: usize,
+) {
+    let duration = opened_at.elapsed();
+    debug!(
+        %peer,
+        stream_id,
+        target_host,
+        target_port,
+        duration_ms = elapsed_millis(duration),
+        bytes_up,
+        bytes_down,
+        mbps = mbps(bytes_up + bytes_down, duration),
+        active_streams,
+        "multiplexed TCP stream closed"
+    );
+}
 
 pub async fn relay_tunnel<S>(mut tunnel_stream: S, peer: SocketAddr) -> Result<()>
 where
@@ -431,62 +1108,6 @@ where
     result.map(|_| ())
 }
 
-async fn write_frame<W>(
-    writer: &mut W,
-    frame_type: FrameType,
-    stream_id: u64,
-    flags: u16,
-    payload: Bytes,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin + ?Sized,
-{
-    if payload.len() > MAX_FRAME_PAYLOAD_LEN {
-        bail!(
-            "frame payload too large: max={}, got={}",
-            MAX_FRAME_PAYLOAD_LEN,
-            payload.len()
-        );
-    }
-
-    let frame = Frame {
-        frame_type,
-        stream_id,
-        flags,
-        payload,
-    };
-    writer.write_all(frame.encode().as_ref()).await?;
-    Ok(())
-}
-
-async fn read_frame<R>(reader: &mut R) -> Result<Frame>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let mut header = [0u8; HEADER_LEN];
-    reader.read_exact(&mut header).await?;
-
-    let payload_len = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
-    if payload_len > MAX_FRAME_PAYLOAD_LEN {
-        bail!(
-            "frame payload too large: max={}, got={}",
-            MAX_FRAME_PAYLOAD_LEN,
-            payload_len
-        );
-    }
-
-    let mut raw = Vec::with_capacity(HEADER_LEN + payload_len);
-    raw.extend_from_slice(&header);
-
-    if payload_len > 0 {
-        let mut payload = vec![0u8; payload_len];
-        reader.read_exact(&mut payload).await?;
-        raw.extend_from_slice(&payload);
-    }
-
-    Frame::decode(Bytes::from(raw)).map_err(|err| anyhow!("failed to decode frame: {err}"))
-}
-
 #[derive(Default)]
 struct UdpRelayCounters {
     tunnel_to_udp_datagrams: AtomicU64,
@@ -527,9 +1148,200 @@ struct UdpRelayCounterSnapshot {
 mod tests {
     use super::*;
     use shroud_core::protocol::{
-        UdpDatagram, decode_udp_associate_response_payload, encode_udp_datagram,
+        UdpDatagram, decode_udp_associate_response_payload, encode_tcp_connect_payload,
+        encode_udp_datagram,
     };
+    use std::collections::{HashMap, HashSet};
     use tokio::io::duplex;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn multiplexed_dispatch_sends_tcp_data_to_registered_stream() -> Result<()> {
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let state = Arc::new(ServerTunnelState {
+            streams: Mutex::new(HashMap::new()),
+            writer_tx,
+            tunnel_closed: AtomicBool::new(false),
+        });
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        state.streams.lock().await.insert(9, stream_tx);
+        let peer = "127.0.0.1:12345".parse::<SocketAddr>()?;
+
+        dispatch_tcp_data_to_target(
+            Arc::clone(&state),
+            peer,
+            Frame {
+                frame_type: FrameType::TcpData,
+                stream_id: 9,
+                flags: 0,
+                payload: Bytes::from_static(b"payload"),
+            },
+        )
+        .await?;
+
+        let payload = timeout(Duration::from_secs(1), stream_rx.recv())
+            .await?
+            .expect("stream payload");
+        assert_eq!(payload, Bytes::from_static(b"payload"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiplexed_remove_stream_drops_target_input_sender() -> Result<()> {
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let state = Arc::new(ServerTunnelState {
+            streams: Mutex::new(HashMap::new()),
+            writer_tx,
+            tunnel_closed: AtomicBool::new(false),
+        });
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        state.streams.lock().await.insert(21, stream_tx);
+
+        remove_multiplexed_stream(&state, 21).await;
+
+        assert!(stream_rx.recv().await.is_none());
+        assert!(!is_multiplexed_stream_active(&state, 21).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiplexed_physical_tunnel_cleanup_drops_all_stream_inputs() -> Result<()> {
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let state = Arc::new(ServerTunnelState {
+            streams: Mutex::new(HashMap::new()),
+            writer_tx,
+            tunnel_closed: AtomicBool::new(false),
+        });
+        let (first_tx, mut first_rx) = mpsc::channel(1);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        state.streams.lock().await.insert(23, first_tx);
+        state.streams.lock().await.insert(25, second_tx);
+
+        state.streams.lock().await.clear();
+
+        assert!(first_rx.recv().await.is_none());
+        assert!(second_rx.recv().await.is_none());
+        assert!(state.streams.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_writer_finishes_when_stream_input_is_dropped() -> Result<()> {
+        let (target_side, mut peer_side) = duplex(1024);
+        let (_target_read, target_write) = tokio::io::split(target_side);
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
+        let transferred =
+            target_writer_loop(27, target_write, rx, Arc::new(AtomicU64::new(0))).await?;
+
+        assert_eq!(transferred, 0);
+        let mut buf = [0u8; 1];
+        let n = timeout(Duration::from_secs(1), peer_side.read(&mut buf)).await??;
+        assert_eq!(n, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiplexed_writer_loop_serializes_frame_commands() -> Result<()> {
+        let (stream, mut peer) = duplex(1024);
+        let (_read_half, write_half) = tokio::io::split(stream);
+        let (tx, rx) = mpsc::channel(1);
+        let writer = tokio::spawn(server_tunnel_writer_loop(write_half, rx));
+
+        tx.send(FrameCommand {
+            frame_type: FrameType::TcpData,
+            stream_id: 13,
+            flags: 0,
+            payload: Bytes::from_static(b"hello"),
+        })
+        .await?;
+        drop(tx);
+
+        let frame = timeout(Duration::from_secs(1), read_frame(&mut peer)).await??;
+        writer.await?;
+
+        assert_eq!(frame.frame_type, FrameType::TcpData);
+        assert_eq!(frame.stream_id, 13);
+        assert_eq!(frame.payload, Bytes::from_static(b"hello"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback TCP sockets"]
+    async fn multiplexed_tunnel_relays_tcp_data_for_multiple_streams() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let target_addr = listener.local_addr()?;
+        let echo_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await?;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let n = socket.read(&mut buf).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        socket.write_all(&buf[..n]).await?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                });
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        let (mut client_side, server_side) = duplex(128 * 1024);
+        let peer = "127.0.0.1:12345".parse::<SocketAddr>()?;
+        let relay_task = tokio::spawn(relay_multiplexed_tunnel(server_side, peer));
+
+        for (stream_id, payload) in [(1, b"one".as_slice()), (3, b"three".as_slice())] {
+            write_frame(
+                &mut client_side,
+                FrameType::TcpConnect,
+                stream_id,
+                0,
+                encode_tcp_connect_payload(&target_addr.ip().to_string(), target_addr.port())?,
+            )
+            .await?;
+            write_frame(
+                &mut client_side,
+                FrameType::TcpData,
+                stream_id,
+                0,
+                Bytes::copy_from_slice(payload),
+            )
+            .await?;
+        }
+
+        let mut connected = HashSet::new();
+        let mut echoed = HashMap::new();
+        while connected.len() < 2 || echoed.len() < 2 {
+            let frame = timeout(Duration::from_secs(2), read_frame(&mut client_side)).await??;
+            match frame.frame_type {
+                FrameType::TcpConnect => {
+                    assert_ne!(frame.flags & CONNECT_OK_FLAG, 0);
+                    connected.insert(frame.stream_id);
+                }
+                FrameType::TcpData => {
+                    echoed.insert(frame.stream_id, frame.payload);
+                }
+                other => bail!("unexpected frame from multiplexed tunnel: {other}"),
+            }
+        }
+
+        assert!(connected.contains(&1));
+        assert!(connected.contains(&3));
+        assert_eq!(echoed.get(&1), Some(&Bytes::from_static(b"one")));
+        assert_eq!(echoed.get(&3), Some(&Bytes::from_static(b"three")));
+
+        write_frame(&mut client_side, FrameType::TcpClose, 1, 0, Bytes::new()).await?;
+        write_frame(&mut client_side, FrameType::TcpClose, 3, 0, Bytes::new()).await?;
+        drop(client_side);
+
+        echo_task.await??;
+        timeout(Duration::from_secs(2), relay_task).await???;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn udp_associate_relays_datagrams_both_directions() -> Result<()> {

@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 16;
@@ -46,6 +47,14 @@ impl TryFrom<u8> for FrameType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
+    pub frame_type: FrameType,
+    pub stream_id: u64,
+    pub flags: u16,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameCommand {
     pub frame_type: FrameType,
     pub stream_id: u64,
     pub flags: u16,
@@ -109,6 +118,60 @@ impl Frame {
     }
 }
 
+pub async fn write_frame<W>(
+    writer: &mut W,
+    frame_type: FrameType,
+    stream_id: u64,
+    flags: u16,
+    payload: Bytes,
+) -> Result<(), ProtocolError>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    if payload.len() > MAX_FRAME_PAYLOAD_LEN {
+        return Err(ProtocolError::FramePayloadTooLarge {
+            max: MAX_FRAME_PAYLOAD_LEN,
+            got: payload.len(),
+        });
+    }
+
+    let frame = Frame {
+        frame_type,
+        stream_id,
+        flags,
+        payload,
+    };
+    writer.write_all(frame.encode().as_ref()).await?;
+    Ok(())
+}
+
+pub async fn read_frame<R>(reader: &mut R) -> Result<Frame, ProtocolError>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut header = [0u8; HEADER_LEN];
+    reader.read_exact(&mut header).await?;
+
+    let payload_len = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
+    if payload_len > MAX_FRAME_PAYLOAD_LEN {
+        return Err(ProtocolError::FramePayloadTooLarge {
+            max: MAX_FRAME_PAYLOAD_LEN,
+            got: payload_len,
+        });
+    }
+
+    let mut raw = Vec::with_capacity(HEADER_LEN + payload_len);
+    raw.extend_from_slice(&header);
+
+    if payload_len > 0 {
+        let mut payload = vec![0u8; payload_len];
+        reader.read_exact(&mut payload).await?;
+        raw.extend_from_slice(&payload);
+    }
+
+    Frame::decode(Bytes::from(raw))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AddressType {
@@ -154,6 +217,8 @@ pub enum ProtocolError {
     DomainTooLong(usize),
     #[error("udp datagram payload is too large: max={max}, got={got}")]
     UdpDatagramPayloadTooLarge { max: usize, got: usize },
+    #[error("frame IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl fmt::Display for FrameType {
@@ -414,6 +479,40 @@ mod tests {
         assert_eq!(decoded.stream_id, 42);
         assert_eq!(decoded.flags, 1);
         assert_eq!(decoded.payload, Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn read_write_frame_preserves_non_default_stream_id() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+
+        write_frame(
+            &mut writer,
+            FrameType::TcpData,
+            7,
+            0x0002,
+            Bytes::from_static(b"payload"),
+        )
+        .await
+        .expect("write frame");
+
+        let decoded = read_frame(&mut reader).await.expect("read frame");
+
+        assert_eq!(decoded.frame_type, FrameType::TcpData);
+        assert_eq!(decoded.stream_id, 7);
+        assert_eq!(decoded.flags, 0x0002);
+        assert_eq!(decoded.payload, Bytes::from_static(b"payload"));
+    }
+
+    #[tokio::test]
+    async fn write_frame_rejects_oversized_payload() {
+        let (mut writer, _reader) = tokio::io::duplex(1024);
+        let payload = Bytes::from(vec![0u8; MAX_FRAME_PAYLOAD_LEN + 1]);
+
+        let err = write_frame(&mut writer, FrameType::TcpData, 1, 0, payload)
+            .await
+            .expect_err("oversized frame must fail");
+
+        assert!(matches!(err, ProtocolError::FramePayloadTooLarge { .. }));
     }
 
     #[test]

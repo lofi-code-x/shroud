@@ -609,6 +609,7 @@ async fn start_tunnel_server() -> TestResult<RunningTask> {
             cert_path: Some(SERVER_CERT.to_string()),
             key_path: Some(SERVER_KEY.to_string()),
         },
+        multiplex: Default::default(),
         clients: vec![AuthorizedClient {
             client_id: CLIENT_ID.to_string(),
             client_secret: CLIENT_SECRET.to_string(),
@@ -772,6 +773,7 @@ fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
         tls: true,
         tls_server_name: Some("localhost".to_string()),
         tls_ca_cert_path: Some(CA_CERT.to_string()),
+        multiplex: false,
     }
 }
 
@@ -783,6 +785,7 @@ fn outbound_config_plain(server_addr: SocketAddr, path: &str) -> OutboundConfig 
         tls: false,
         tls_server_name: None,
         tls_ca_cert_path: None,
+        multiplex: false,
     }
 }
 

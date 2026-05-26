@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use shroud_client::{routing, session, socks5, tun, tunnel};
+use shroud_client::{routing, session, socks5, tun, tunnel, tunnel_manager};
 use shroud_core::config::{generate_client_credentials, load_client_config_yaml};
 use std::fs;
 use tracing::info;
@@ -40,10 +40,10 @@ async fn main() -> Result<()> {
     }
 
     let router = routing::Router::try_new(cfg.routing.clone()).context("invalid routing config")?;
-    let tunnel = tunnel::TunnelClient::new(outbound.clone(), cfg.auth.clone());
-    let session = session::SessionCore::new(router, tunnel, cfg.dns.clone());
 
     if cfg.inbounds.tun.enabled {
+        let tunnel = tunnel::TunnelClient::new(outbound.clone(), cfg.auth.clone());
+        let session = session::SessionCore::new(router, tunnel, cfg.dns.clone());
         let device = tun::device::open(&cfg.inbounds.tun)
             .with_context(|| format!("failed to set up TUN device {}", cfg.inbounds.tun.name))?;
         info!(
@@ -77,6 +77,17 @@ async fn main() -> Result<()> {
         .context("no enabled SOCKS inbound configured")?;
 
     info!(listen = %socks.listen, "starting shroud client");
+
+    let tunnel = tunnel::TunnelClient::new(outbound.clone(), cfg.auth.clone());
+    let session = if outbound.multiplex {
+        let tunnel_manager =
+            tunnel_manager::TunnelManager::connect(outbound.clone(), cfg.auth.clone())
+                .await
+                .context("failed to connect persistent tunnel manager")?;
+        session::SessionCore::new_multiplexed(router, tunnel, tunnel_manager, cfg.dns.clone())
+    } else {
+        session::SessionCore::new(router, tunnel, cfg.dns.clone())
+    };
 
     socks5::serve(socks.listen, session).await
 }

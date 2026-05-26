@@ -119,6 +119,8 @@ pub struct OutboundConfig {
     pub tls_server_name: Option<String>,
     #[serde(default)]
     pub tls_ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub multiplex: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -215,6 +217,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls: ServerTlsConfig,
     #[serde(default)]
+    pub multiplex: ServerMultiplexConfig,
+    #[serde(default)]
     pub clients: Vec<AuthorizedClient>,
 }
 
@@ -226,6 +230,12 @@ pub struct ServerTlsConfig {
     pub cert_path: Option<String>,
     #[serde(default)]
     pub key_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerMultiplexConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -808,6 +818,24 @@ clients:
         assert!(message.contains("tls.cert_path"));
         assert!(message.contains("tls.key_path"));
         assert!(message.contains("clients[0].client_secret"));
+    }
+
+    #[test]
+    fn server_config_accepts_multiplex_enabled() {
+        let raw = r#"
+listen: "127.0.0.1:8443"
+tunnel_path: "/api/tunnel"
+web_root: "."
+multiplex:
+  enabled: true
+clients:
+  - client_id: "11111111-1111-1111-1111-111111111111"
+    client_secret: "secret"
+"#;
+
+        let cfg = load_server_config_yaml(raw).expect("valid config");
+
+        assert!(cfg.multiplex.enabled);
     }
 
     #[test]
