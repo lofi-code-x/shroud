@@ -1,9 +1,9 @@
 use crate::routing::Router;
-use crate::tunnel::{RelayStats, TunnelClient, TunnelStream, UdpTunnel};
+use crate::tunnel::{RelayStats, TunnelClient, TunnelOpenTimings, TunnelStream, UdpTunnel};
 use anyhow::{Context, Result};
 use shroud_core::config::{ClientDnsConfig, RouteAction};
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -72,17 +72,19 @@ impl SessionCore {
 
         match action {
             RouteAction::Proxy => {
-                let stream = self
+                let tunnel = self
                     .tunnel
-                    .connect_target_via_tunnel(target_host, target_port)
+                    .connect_target_via_tunnel_with_timings(target_host, target_port)
                     .await
                     .context("proxy tunnel connect failed")?;
                 Ok(TcpOpenResult::Opened(TcpOutbound {
                     action,
-                    stream: TcpOutboundStream::Proxy(stream),
+                    metrics: TcpOpenMetrics::from(tunnel.timings),
+                    stream: TcpOutboundStream::Proxy(tunnel.stream),
                 }))
             }
             RouteAction::Direct => {
+                let target_connect_started = Instant::now();
                 let stream = timeout(
                     DIRECT_TARGET_CONNECT_TIMEOUT,
                     TcpStream::connect((target_host, target_port)),
@@ -96,8 +98,20 @@ impl SessionCore {
                 .with_context(|| {
                     format!("failed to open direct tcp connection to {target_host}:{target_port}")
                 })?;
+                let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
+
+                stream.set_nodelay(true).with_context(|| {
+                    format!(
+                        "failed to enable TCP_NODELAY for direct tcp connection to {target_host}:{target_port}"
+                    )
+                })?;
+
                 Ok(TcpOpenResult::Opened(TcpOutbound {
                     action,
+                    metrics: TcpOpenMetrics {
+                        target_tcp_connect_ms,
+                        ..TcpOpenMetrics::default()
+                    },
                     stream: TcpOutboundStream::Direct(stream),
                 }))
             }
@@ -142,7 +156,7 @@ where
 
     let client_to_upstream = async {
         let mut transferred = 0u64;
-        let mut buf = [0u8; 16 * 1024];
+        let mut buf = [0u8; 64 * 1024];
 
         loop {
             let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))
@@ -166,7 +180,7 @@ where
 
     let upstream_to_client = async {
         let mut transferred = 0u64;
-        let mut buf = [0u8; 16 * 1024];
+        let mut buf = [0u8; 64 * 1024];
 
         loop {
             let n = timeout(RELAY_IDLE_TIMEOUT, upstream_read.read(&mut buf))
@@ -216,7 +230,31 @@ pub enum TcpOpenResult {
 
 pub struct TcpOutbound {
     pub action: RouteAction,
+    pub metrics: TcpOpenMetrics,
     stream: TcpOutboundStream,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcpOpenMetrics {
+    pub server_tcp_connect_ms: Option<u64>,
+    pub tls_handshake_ms: Option<u64>,
+    pub http_upgrade_ms: Option<u64>,
+    pub target_tcp_connect_ms: u64,
+}
+
+impl From<TunnelOpenTimings> for TcpOpenMetrics {
+    fn from(timings: TunnelOpenTimings) -> Self {
+        Self {
+            server_tcp_connect_ms: Some(timings.server_tcp_connect_ms),
+            tls_handshake_ms: timings.tls_handshake_ms,
+            http_upgrade_ms: Some(timings.http_upgrade_ms),
+            target_tcp_connect_ms: timings.target_tcp_connect_ms,
+        }
+    }
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 enum TcpOutboundStream {

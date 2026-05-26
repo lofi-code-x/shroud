@@ -12,7 +12,7 @@ use shroud_core::protocol::{
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -40,6 +40,41 @@ pub type TunnelStream = Box<dyn TunnelIo>;
 pub struct RelayStats {
     pub client_to_upstream_bytes: u64,
     pub upstream_to_client_bytes: u64,
+}
+
+impl RelayStats {
+    pub fn total_bytes(self) -> u64 {
+        self.client_to_upstream_bytes + self.upstream_to_client_bytes
+    }
+
+    pub fn mbps(self, elapsed: Duration) -> f64 {
+        let seconds = elapsed.as_secs_f64();
+        if seconds > 0.0 {
+            (self.total_bytes() as f64 * 8.0) / seconds / 1_000_000.0
+        } else {
+            0.0
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TunnelOpenTimings {
+    pub server_tcp_connect_ms: u64,
+    pub tls_handshake_ms: Option<u64>,
+    pub http_upgrade_ms: u64,
+    pub target_tcp_connect_ms: u64,
+}
+
+pub struct TcpTunnel {
+    pub stream: TunnelStream,
+    pub timings: TunnelOpenTimings,
+}
+
+struct TunnelTransport {
+    stream: TunnelStream,
+    server_tcp_connect_ms: u64,
+    tls_handshake_ms: Option<u64>,
+    http_upgrade_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +171,17 @@ impl TunnelClient {
         target_host: &str,
         target_port: u16,
     ) -> Result<TunnelStream> {
+        Ok(self
+            .connect_target_via_tunnel_with_timings(target_host, target_port)
+            .await?
+            .stream)
+    }
+
+    pub async fn connect_target_via_tunnel_with_timings(
+        &self,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<TcpTunnel> {
         self.open_tunnel(target_host, target_port).await
     }
 
@@ -143,7 +189,8 @@ impl TunnelClient {
         let mut stream = self
             .open_tunnel_transport("<udp-associate>", 0)
             .await
-            .context("failed to open tunnel transport for UDP associate")?;
+            .context("failed to open tunnel transport for UDP associate")?
+            .stream;
 
         write_frame(
             &mut stream,
@@ -206,7 +253,7 @@ impl TunnelClient {
 
         let client_to_upstream = async {
             let mut transferred = 0u64;
-            let mut buf = [0u8; 16 * 1024];
+            let mut buf = [0u8; 64 * 1024];
 
             loop {
                 let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))
@@ -296,16 +343,24 @@ impl TunnelClient {
         })
     }
 
-    async fn open_tunnel(&self, target_host: &str, target_port: u16) -> Result<TunnelStream> {
-        let mut stream = self.open_tunnel_transport(target_host, target_port).await?;
+    async fn open_tunnel(&self, target_host: &str, target_port: u16) -> Result<TcpTunnel> {
+        let transport = self.open_tunnel_transport(target_host, target_port).await?;
+        let TunnelTransport {
+            mut stream,
+            server_tcp_connect_ms,
+            tls_handshake_ms,
+            http_upgrade_ms,
+        } = transport;
 
         let payload = encode_tcp_connect_payload(target_host, target_port)
             .map_err(|err| anyhow!("failed to encode tcp connect payload: {err}"))?;
+        let target_connect_started = Instant::now();
         write_frame(&mut stream, FrameType::TcpConnect, STREAM_ID, 0, payload).await?;
 
         let connect_reply = timeout(TCP_CONNECT_REPLY_TIMEOUT, read_frame(&mut stream))
             .await
             .context("timed out waiting for TCP_CONNECT reply")??;
+        let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
         if connect_reply.stream_id != STREAM_ID {
             bail!(
                 "unexpected stream id in connect reply: {}",
@@ -314,7 +369,24 @@ impl TunnelClient {
         }
 
         match connect_reply.frame_type {
-            FrameType::TcpConnect if (connect_reply.flags & CONNECT_OK_FLAG) != 0 => Ok(stream),
+            FrameType::TcpConnect if (connect_reply.flags & CONNECT_OK_FLAG) != 0 => {
+                debug!(
+                    server = %self.outbound.server,
+                    target_host,
+                    target_port,
+                    target_tcp_connect_ms,
+                    "tunnel target TCP_CONNECT finished"
+                );
+                Ok(TcpTunnel {
+                    stream,
+                    timings: TunnelOpenTimings {
+                        server_tcp_connect_ms,
+                        tls_handshake_ms,
+                        http_upgrade_ms,
+                        target_tcp_connect_ms,
+                    },
+                })
+            }
             FrameType::ErrorFrame => {
                 let message = String::from_utf8_lossy(connect_reply.payload.as_ref()).into_owned();
                 bail!("server refused TCP_CONNECT: {message}");
@@ -333,7 +405,8 @@ impl TunnelClient {
         &self,
         target_host: &str,
         target_port: u16,
-    ) -> Result<TunnelStream> {
+    ) -> Result<TunnelTransport> {
+        let server_connect_started = Instant::now();
         let stream = timeout(
             TUNNEL_ENDPOINT_CONNECT_TIMEOUT,
             TcpStream::connect((self.outbound.server.as_str(), self.outbound.port)),
@@ -351,8 +424,26 @@ impl TunnelClient {
                 self.outbound.server, self.outbound.port
             )
         })?;
+        let server_tcp_connect_ms = elapsed_millis(server_connect_started.elapsed());
+        debug!(
+            server = %self.outbound.server,
+            port = self.outbound.port,
+            target_host,
+            target_port,
+            server_tcp_connect_ms,
+            "tunnel server TCP connect finished"
+        );
 
+        stream.set_nodelay(true).with_context(|| {
+            format!(
+                "failed to enable TCP_NODELAY for tunnel endpoint {}:{}",
+                self.outbound.server, self.outbound.port
+            )
+        })?;
+
+        let mut tls_handshake_ms = None;
         let mut stream: TunnelStream = if self.outbound.tls {
+            let tls_started = Instant::now();
             let connector = TlsConnector::from(Arc::new(build_tls_client_config(&self.outbound)?));
             let server_name = self
                 .outbound
@@ -379,6 +470,16 @@ impl TunnelClient {
                     self.outbound.server, self.outbound.port
                 )
             })?;
+            let elapsed_ms = elapsed_millis(tls_started.elapsed());
+            tls_handshake_ms = Some(elapsed_ms);
+            debug!(
+                server = %self.outbound.server,
+                port = self.outbound.port,
+                target_host,
+                target_port,
+                tls_handshake_ms = elapsed_ms,
+                "tunnel TLS handshake finished"
+            );
             Box::new(tls_stream)
         } else {
             Box::new(stream)
@@ -408,6 +509,7 @@ impl TunnelClient {
             nonce = STANDARD_NO_PAD.encode(&nonce),
             auth = auth_tag,
         );
+        let http_upgrade_started = Instant::now();
         stream.write_all(request.as_bytes()).await?;
 
         let response = timeout(
@@ -417,6 +519,7 @@ impl TunnelClient {
         .await
         .context("timed out waiting for HTTP upgrade response")??;
         let status = parse_status_code(&response).context("failed to parse tunnel response")?;
+        let http_upgrade_ms = elapsed_millis(http_upgrade_started.elapsed());
 
         if status != 101 {
             bail!("tunnel endpoint rejected upgrade with HTTP status {status}");
@@ -428,11 +531,21 @@ impl TunnelClient {
             client_id = %self.auth.client_id,
             target_host,
             target_port,
+            http_upgrade_ms,
             "tunnel upgrade accepted"
         );
 
-        Ok(stream)
+        Ok(TunnelTransport {
+            stream,
+            server_tcp_connect_ms,
+            tls_handshake_ms,
+            http_upgrade_ms,
+        })
     }
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn build_tls_client_config(outbound: &OutboundConfig) -> Result<ClientConfig> {

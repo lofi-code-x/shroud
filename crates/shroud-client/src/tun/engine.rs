@@ -7,6 +7,7 @@ use netstack_smoltcp::{StackBuilder, TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
@@ -178,7 +179,31 @@ async fn handle_tcp_stream(
 
     match session.open_tcp(&target_host, target_port).await? {
         TcpOpenResult::Opened(mut outbound) => {
-            session.relay_tcp(&mut stream, &mut outbound).await?;
+            let action = outbound.action;
+            let metrics = outbound.metrics;
+            let relay_started = Instant::now();
+            let stats = session.relay_tcp(&mut stream, &mut outbound).await?;
+            let relay_elapsed = relay_started.elapsed();
+            let total_bytes = stats.total_bytes();
+            let mbps = stats.mbps(relay_elapsed);
+
+            debug!(
+                %source,
+                %destination,
+                target_host,
+                target_port,
+                route = ?action,
+                server_tcp_connect_ms = metrics.server_tcp_connect_ms,
+                tls_handshake_ms = metrics.tls_handshake_ms,
+                http_upgrade_ms = metrics.http_upgrade_ms,
+                target_tcp_connect_ms = metrics.target_tcp_connect_ms,
+                client_to_upstream_bytes = stats.client_to_upstream_bytes,
+                upstream_to_client_bytes = stats.upstream_to_client_bytes,
+                total_bytes,
+                duration_ms = elapsed_millis(relay_elapsed),
+                mbps,
+                "TUN TCP relay finished"
+            );
         }
         TcpOpenResult::Blocked => {
             bail!("route blocked TUN TCP target {target_host}:{target_port}");
@@ -186,6 +211,10 @@ async fn handle_tcp_stream(
     }
 
     Ok(())
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn resolve_target_host(fake_dns: &FakeDns, ip: IpAddr) -> String {

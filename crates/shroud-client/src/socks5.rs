@@ -6,7 +6,7 @@ use shroud_core::protocol::AddressType;
 use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
@@ -32,6 +32,9 @@ pub async fn serve(listen: SocketAddr, session: SessionCore) -> Result<()> {
             }
             accept_result = listener.accept() => {
                 let (socket, peer) = accept_result?;
+                socket.set_nodelay(true)
+                    .context("failed to enable TCP_NODELAY for SOCKS client socket")?;
+
                 debug!(%peer, "new connection");
 
                 let session = session.clone();
@@ -122,22 +125,38 @@ async fn handle_connection(
 
     write_reply(&mut socket, ReplyCode::Succeeded).await?;
     let action = outbound.action;
+    let metrics = outbound.metrics;
+    let relay_started = Instant::now();
     let stats = session
         .relay_tcp(&mut socket, &mut outbound)
         .await
         .with_context(|| format!("relay failed for {target_host}:{target_port}"))?;
+    let relay_elapsed = relay_started.elapsed();
+    let total_bytes = stats.total_bytes();
+    let mbps = stats.mbps(relay_elapsed);
 
     debug!(
         %peer,
         target_host,
         target_port,
         route = ?action,
+        server_tcp_connect_ms = metrics.server_tcp_connect_ms,
+        tls_handshake_ms = metrics.tls_handshake_ms,
+        http_upgrade_ms = metrics.http_upgrade_ms,
+        target_tcp_connect_ms = metrics.target_tcp_connect_ms,
         client_to_upstream_bytes = stats.client_to_upstream_bytes,
         upstream_to_client_bytes = stats.upstream_to_client_bytes,
+        total_bytes,
+        duration_ms = elapsed_millis(relay_elapsed),
+        mbps,
         "connection relay finished"
     );
 
     Ok(())
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn handle_udp_associate(

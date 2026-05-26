@@ -49,15 +49,35 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
             }
             accept_result = listener.accept() => {
                 let (stream, peer) = accept_result?;
+
+                stream.set_nodelay(true)
+                    .context("failed to enable TCP_NODELAY for accepted tunnel socket")?;
+
                 let cfg = cfg.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let nonce_cache = nonce_cache.clone();
 
                 active.spawn(async move {
                     let result = if let Some(acceptor) = tls_acceptor {
+                        let tls_started = Instant::now();
                         match acceptor.accept(stream).await {
-                            Ok(stream) => handle_connection(stream, peer, cfg, nonce_cache).await,
-                            Err(err) => Err(anyhow!(err)).context("tls handshake failed"),
+                            Ok(stream) => {
+                                debug!(
+                                    %peer,
+                                    tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
+                                    "server TLS handshake finished"
+                                );
+                                handle_connection(stream, peer, cfg, nonce_cache).await
+                            }
+                            Err(err) => {
+                                debug!(
+                                    %peer,
+                                    tls_handshake_ms = elapsed_millis(tls_started.elapsed()),
+                                    error = %err,
+                                    "server TLS handshake failed"
+                                );
+                                Err(anyhow!(err)).context("tls handshake failed")
+                            }
                         }
                     } else {
                         handle_connection(stream, peer, cfg, nonce_cache).await
@@ -149,6 +169,7 @@ async fn handle_tunnel_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let http_upgrade_started = Instant::now();
     let Some(client_id) = optional_header(&parsed.headers, "x-shroud-client-id") else {
         write_error_response(&mut stream, 403, false).await?;
         bail!("missing required header x-shroud-client-id");
@@ -205,8 +226,18 @@ where
             b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: shroud-tunnel\r\n\r\n",
         )
         .await?;
+    debug!(
+        %peer,
+        client_id,
+        http_upgrade_ms = elapsed_millis(http_upgrade_started.elapsed()),
+        "server HTTP upgrade accepted"
+    );
     relay_tunnel(stream, peer).await?;
     Ok(())
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn serve_static_file<S>(

@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use shroud_core::protocol::{
     Frame, FrameType, HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, UdpDatagram, decode_tcp_connect_payload,
@@ -7,7 +7,7 @@ use shroud_core::protocol::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -57,6 +57,7 @@ where
         decode_tcp_connect_payload(connect_request.payload.as_ref())
             .map_err(|err| anyhow!("invalid TCP_CONNECT payload: {err}"))?;
 
+    let target_connect_started = Instant::now();
     let mut target_stream = match timeout(
         TARGET_CONNECT_TIMEOUT,
         TcpStream::connect((target_host.as_str(), target_port)),
@@ -64,7 +65,16 @@ where
     .await
     {
         Err(_) => {
+            let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
             let message = format!("timed out connecting target {target_host}:{target_port}");
+            debug!(
+                %peer,
+                stream_id,
+                target_host,
+                target_port,
+                target_tcp_connect_ms,
+                "target TCP connect timed out"
+            );
             write_frame(
                 &mut tunnel_stream,
                 FrameType::ErrorFrame,
@@ -75,9 +85,37 @@ where
             .await?;
             bail!("{message}");
         }
-        Ok(Ok(stream)) => stream,
+        Ok(Ok(stream)) => {
+            let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
+            stream.set_nodelay(true).with_context(|| {
+                format!(
+                    "failed to enable TCP_NODELAY for target connection {target_host}:{target_port}"
+                )
+            })?;
+
+            debug!(
+                %peer,
+                stream_id,
+                target_host,
+                target_port,
+                target_tcp_connect_ms,
+                "target TCP connect finished"
+            );
+
+            stream
+        }
         Ok(Err(err)) => {
+            let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
             let message = format!("failed to connect target {target_host}:{target_port}: {err}");
+            debug!(
+                %peer,
+                stream_id,
+                target_host,
+                target_port,
+                target_tcp_connect_ms,
+                error = %err,
+                "target TCP connect failed"
+            );
             write_frame(
                 &mut tunnel_stream,
                 FrameType::ErrorFrame,
@@ -89,6 +127,7 @@ where
             bail!("{message}");
         }
     };
+    let target_tcp_connect_ms = elapsed_millis(target_connect_started.elapsed());
 
     write_frame(
         &mut tunnel_stream,
@@ -99,6 +138,7 @@ where
     )
     .await?;
 
+    let relay_started = Instant::now();
     let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel_stream);
     let (mut target_read, mut target_write) = target_stream.split();
 
@@ -149,7 +189,7 @@ where
 
     let target_to_tunnel = async {
         let mut transferred = 0u64;
-        let mut buf = [0u8; 16 * 1024];
+        let mut buf = [0u8; 64 * 1024];
 
         loop {
             let n = timeout(RELAY_IDLE_TIMEOUT, target_read.read(&mut buf))
@@ -194,18 +234,38 @@ where
 
     let (upstream_to_target_bytes, target_to_upstream_bytes) =
         tokio::try_join!(tunnel_to_target, target_to_tunnel)?;
+    let relay_elapsed = relay_started.elapsed();
+    let total_bytes = upstream_to_target_bytes + target_to_upstream_bytes;
+    let mbps = mbps(total_bytes, relay_elapsed);
 
     debug!(
         %peer,
         stream_id,
         target_host,
         target_port,
+        target_tcp_connect_ms,
         upstream_to_target_bytes,
         target_to_upstream_bytes,
+        total_bytes,
+        duration_ms = elapsed_millis(relay_elapsed),
+        mbps,
         "tunnel relay finished"
     );
 
     Ok(())
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn mbps(total_bytes: u64, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds > 0.0 {
+        (total_bytes as f64 * 8.0) / seconds / 1_000_000.0
+    } else {
+        0.0
+    }
 }
 
 async fn relay_udp_association<S>(
