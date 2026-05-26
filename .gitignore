@@ -1,2 +1,3 @@
 /target
 **/*.rs.bk
+/configs/client-remote.yaml

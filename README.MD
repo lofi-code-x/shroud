@@ -1,8 +1,8 @@
 # Shroud
 
-Shroud is an experimental Rust client/server TCP tunneling project.
+Shroud is an experimental Rust client/server tunneling project.
 
-The current implementation provides a local client inbound, an authenticated tunnel transport to a remote server, and server-side TCP relay to the requested target. The stable MVP path is **SOCKS5 TCP CONNECT over an HTTP/1.1 Upgrade tunnel**, optionally protected by TLS.
+The current implementation provides local client inbounds, an authenticated tunnel transport to a remote server, and server-side TCP/UDP relay to the requested target. The main stable path is **SOCKS5 TCP CONNECT over an HTTP/1.1 Upgrade tunnel**, optionally protected by TLS. SOCKS5 `UDP ASSOCIATE` is implemented for proxied UDP datagrams.
 
 The project also contains an early Linux **TUN mode** backed by `netstack-smoltcp`. TUN currently targets controlled beta/smoke-test scenarios and is not yet a full VPN replacement.
 
@@ -13,18 +13,24 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
 - Rust workspace with three crates:
   - `shroud-core` — shared config, auth and frame protocol code;
   - `shroud-client` — local SOCKS5/TUN client and tunnel outbound;
-  - `shroud-server` — HTTP/TLS listener, auth validation, static fallback and TCP relay.
+  - `shroud-server` — HTTP/TLS listener, auth validation, static fallback and TCP/UDP relay.
 - SOCKS5 inbound:
   - no-auth SOCKS5 handshake;
   - `CONNECT` command;
+  - `UDP ASSOCIATE` command;
   - IPv4, IPv6 and domain targets;
-  - TCP-only relay.
+  - TCP relay;
+  - UDP datagram relay through the tunnel for `proxy` routes;
+  - UDP endpoint validation against the TCP control connection and the client's declared UDP endpoint;
+  - fragmented SOCKS UDP packets are dropped.
 - Tunnel transport:
   - HTTP/1.1 `Upgrade: shroud-tunnel`;
   - optional TLS;
   - custom framed protocol;
   - max frame payload size: `64 KiB`;
-  - oversized frame rejection before payload allocation.
+  - oversized frame rejection before payload allocation;
+  - TCP stream frames;
+  - UDP association and UDP datagram frames.
 - Authentication:
   - `client_id` / `client_secret` based auth header;
   - timestamp validation;
@@ -45,6 +51,10 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
   - `GET /api/status` health endpoint;
   - static fallback from `web_root`;
   - minimal diagnostic exposure.
+- Server relay:
+  - TCP connect and relay to requested targets;
+  - UDP association bind;
+  - UDP datagram send/receive with source address preserved in response datagrams.
 - TUN mode:
   - Linux TUN device creation through `/dev/net/tun`;
   - no packet information header (`IFF_NO_PI`);
@@ -59,6 +69,8 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
   - routing unit tests;
   - config validation tests;
   - SOCKS/TLS tunnel integration tests;
+  - SOCKS UDP ASSOCIATE integration test;
+  - server-side UDP relay integration test;
   - large payload relay test;
   - half-close behavior test;
   - timeout/error-path tests;
@@ -66,8 +78,7 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
 
 ### Not implemented yet
 
-- SOCKS5 `UDP ASSOCIATE`.
-- UDP relay.
+- Direct UDP routing from the SOCKS inbound.
 - TUN UDP forwarding.
 - Browser DoH/DoT interception.
 - Multiplexing of multiple logical streams over one tunnel connection.
@@ -92,6 +103,7 @@ shroud-client
 shroud-server
         |
         | TCP connect / relay
+        | UDP send / receive
         v
 Target host
 ```
@@ -295,6 +307,22 @@ Use `--socks5-hostname`, not `--socks5`, when you want the domain name to be sen
 
 This is the primary MVP scenario.
 
+### SOCKS5 UDP ASSOCIATE
+
+SOCKS5 `UDP ASSOCIATE` is supported for UDP clients that use the SOCKS5 UDP request header format.
+
+Behavior:
+
+- Shroud binds a local UDP socket and returns its address in `BND.ADDR` / `BND.PORT`;
+- the TCP SOCKS control connection stays open for the lifetime of the UDP association;
+- UDP packets are accepted only from the expected client UDP endpoint;
+- SOCKS UDP headers are decoded locally and encoded again for responses;
+- `proxy` routes are sent through the tunnel as `UdpDatagram` frames;
+- `block` routes are dropped;
+- `direct` routes are currently dropped because direct UDP relay is not implemented yet.
+
+This is covered by the `socks_udp_associate_relays_datagrams_through_tunnel` integration test.
+
 ## DNS leak notes
 
 For SOCKS usage:
@@ -447,7 +475,7 @@ The TUN smoke test is ignored by default because it requires Linux root privileg
 
 ## Protocol summary
 
-Each tunnel connection currently carries one TCP stream.
+Each tunnel connection currently carries either one TCP stream or one UDP association. Multiplexing multiple logical streams or associations over one tunnel connection is not implemented yet.
 
 Frame header:
 
@@ -465,6 +493,9 @@ Important frame types:
 - `TcpConnect` — request or acknowledge a target TCP connection;
 - `TcpData` — relay TCP payload;
 - `TcpClose` — half-close / close notification;
+- `UdpAssociateRequest` — request a remote UDP association;
+- `UdpAssociateResponse` — acknowledge the UDP association and return the remote UDP bind address;
+- `UdpDatagram` — relay one UDP datagram with target/source address metadata;
 - `ErrorFrame` — report tunnel or target connection failure;
 - `Ping` / `Pong` — reserved for keepalive-style behavior.
 
@@ -489,6 +520,7 @@ MAX_FRAME_PAYLOAD_LEN = 64 KiB
 ### MVP stabilization
 
 - Keep SOCKS5 TCP CONNECT as the main stable path.
+- Keep SOCKS5 UDP ASSOCIATE covered by integration tests and harden edge cases.
 - Keep HTTP/1.1 Upgrade transport until the TCP MVP is fully stable.
 - Continue hardening timeouts, frame validation and relay edge cases.
 - Keep `cargo test --workspace` as the default quality gate.
@@ -510,8 +542,7 @@ MAX_FRAME_PAYLOAD_LEN = 64 KiB
 ### Post-MVP
 
 - WebSocket over TLS transport.
-- UDP relay.
-- SOCKS5 `UDP ASSOCIATE`.
+- Direct UDP routing from the SOCKS inbound.
 - TUN UDP forwarding.
 - HTTP/2 transport.
 - QUIC / HTTP/3 transport.

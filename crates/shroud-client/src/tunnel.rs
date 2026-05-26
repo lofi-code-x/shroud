@@ -5,13 +5,15 @@ use bytes::Bytes;
 use shroud_core::auth::compute_auth_tag;
 use shroud_core::config::{ClientAuthConfig, OutboundConfig};
 use shroud_core::protocol::{
-    Frame, FrameType, HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, encode_tcp_connect_payload,
+    Frame, FrameType, HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, UdpDatagram,
+    decode_udp_associate_response_payload, decode_udp_datagram, encode_tcp_connect_payload,
+    encode_udp_datagram,
 };
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
@@ -25,6 +27,7 @@ const CONNECT_OK_FLAG: u16 = 0x0001;
 const TUNNEL_ENDPOINT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_UPGRADE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_CONNECT_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+const UDP_ASSOCIATE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -37,6 +40,84 @@ pub type TunnelStream = Box<dyn TunnelIo>;
 pub struct RelayStats {
     pub client_to_upstream_bytes: u64,
     pub upstream_to_client_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpAssociationInfo {
+    pub remote_bind_host: String,
+    pub remote_bind_port: u16,
+}
+
+pub struct UdpTunnel {
+    stream: TunnelStream,
+    stream_id: u64,
+    pub association: UdpAssociationInfo,
+}
+
+pub struct UdpTunnelReadHalf {
+    reader: ReadHalf<TunnelStream>,
+    stream_id: u64,
+}
+
+pub struct UdpTunnelWriteHalf {
+    writer: WriteHalf<TunnelStream>,
+    stream_id: u64,
+}
+
+impl UdpTunnel {
+    pub fn into_split(self) -> (UdpTunnelReadHalf, UdpTunnelWriteHalf) {
+        let stream_id = self.stream_id;
+        let (reader, writer) = split(self.stream);
+        (
+            UdpTunnelReadHalf { reader, stream_id },
+            UdpTunnelWriteHalf { writer, stream_id },
+        )
+    }
+}
+
+impl UdpTunnelReadHalf {
+    pub async fn recv_datagram(&mut self) -> Result<UdpDatagram> {
+        let frame = timeout(RELAY_IDLE_TIMEOUT, read_frame(&mut self.reader))
+            .await
+            .context("udp relay idle timeout while reading from tunnel")??;
+        if frame.stream_id != self.stream_id {
+            bail!(
+                "unexpected stream id in UDP_DATAGRAM: expected={}, got={}",
+                self.stream_id,
+                frame.stream_id
+            );
+        }
+
+        match frame.frame_type {
+            FrameType::UdpDatagram => decode_udp_datagram(frame.payload.as_ref())
+                .map_err(|err| anyhow!("invalid UDP_DATAGRAM payload: {err}")),
+            FrameType::ErrorFrame => {
+                let message = String::from_utf8_lossy(frame.payload.as_ref()).into_owned();
+                bail!("server returned ERROR frame during UDP relay: {message}");
+            }
+            other => bail!("unexpected frame type from server during UDP relay: {other}"),
+        }
+    }
+}
+
+impl UdpTunnelWriteHalf {
+    pub async fn send_datagram(&mut self, datagram: &UdpDatagram) -> Result<()> {
+        let payload = encode_udp_datagram(datagram)
+            .map_err(|err| anyhow!("failed to encode UDP_DATAGRAM payload: {err}"))?;
+        timeout(
+            RELAY_IDLE_TIMEOUT,
+            write_frame(
+                &mut self.writer,
+                FrameType::UdpDatagram,
+                self.stream_id,
+                0,
+                payload,
+            ),
+        )
+        .await
+        .context("udp relay timeout while writing UDP_DATAGRAM to tunnel")??;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -56,6 +137,60 @@ impl TunnelClient {
         target_port: u16,
     ) -> Result<TunnelStream> {
         self.open_tunnel(target_host, target_port).await
+    }
+
+    pub async fn open_udp_association(&self) -> Result<UdpTunnel> {
+        let mut stream = self
+            .open_tunnel_transport("<udp-associate>", 0)
+            .await
+            .context("failed to open tunnel transport for UDP associate")?;
+
+        write_frame(
+            &mut stream,
+            FrameType::UdpAssociateRequest,
+            STREAM_ID,
+            0,
+            Bytes::new(),
+        )
+        .await?;
+
+        let response = timeout(UDP_ASSOCIATE_REPLY_TIMEOUT, read_frame(&mut stream))
+            .await
+            .context("timed out waiting for UDP_ASSOCIATE response")??;
+        if response.stream_id != STREAM_ID {
+            bail!(
+                "unexpected stream id in UDP associate response: {}",
+                response.stream_id
+            );
+        }
+
+        match response.frame_type {
+            FrameType::UdpAssociateResponse if (response.flags & CONNECT_OK_FLAG) != 0 => {
+                let (remote_bind_host, remote_bind_port) =
+                    decode_udp_associate_response_payload(response.payload.as_ref())
+                        .map_err(|err| anyhow!("invalid UDP_ASSOCIATE response payload: {err}"))?;
+                Ok(UdpTunnel {
+                    stream,
+                    stream_id: STREAM_ID,
+                    association: UdpAssociationInfo {
+                        remote_bind_host,
+                        remote_bind_port,
+                    },
+                })
+            }
+            FrameType::UdpAssociateResponse => {
+                let message = String::from_utf8_lossy(response.payload.as_ref()).into_owned();
+                bail!(
+                    "server refused UDP_ASSOCIATE: flags={}, message={message}",
+                    response.flags
+                );
+            }
+            FrameType::ErrorFrame => {
+                let message = String::from_utf8_lossy(response.payload.as_ref()).into_owned();
+                bail!("server refused UDP_ASSOCIATE: {message}");
+            }
+            other => bail!("unexpected frame type instead of UDP associate response: {other}"),
+        }
     }
 
     pub async fn relay_over_tunnel_stream<S>(
@@ -162,6 +297,43 @@ impl TunnelClient {
     }
 
     async fn open_tunnel(&self, target_host: &str, target_port: u16) -> Result<TunnelStream> {
+        let mut stream = self.open_tunnel_transport(target_host, target_port).await?;
+
+        let payload = encode_tcp_connect_payload(target_host, target_port)
+            .map_err(|err| anyhow!("failed to encode tcp connect payload: {err}"))?;
+        write_frame(&mut stream, FrameType::TcpConnect, STREAM_ID, 0, payload).await?;
+
+        let connect_reply = timeout(TCP_CONNECT_REPLY_TIMEOUT, read_frame(&mut stream))
+            .await
+            .context("timed out waiting for TCP_CONNECT reply")??;
+        if connect_reply.stream_id != STREAM_ID {
+            bail!(
+                "unexpected stream id in connect reply: {}",
+                connect_reply.stream_id
+            );
+        }
+
+        match connect_reply.frame_type {
+            FrameType::TcpConnect if (connect_reply.flags & CONNECT_OK_FLAG) != 0 => Ok(stream),
+            FrameType::ErrorFrame => {
+                let message = String::from_utf8_lossy(connect_reply.payload.as_ref()).into_owned();
+                bail!("server refused TCP_CONNECT: {message}");
+            }
+            FrameType::TcpConnect => {
+                bail!(
+                    "server returned TCP_CONNECT without success flag; flags={}",
+                    connect_reply.flags
+                );
+            }
+            other => bail!("unexpected frame type instead of connect reply: {other}"),
+        }
+    }
+
+    async fn open_tunnel_transport(
+        &self,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<TunnelStream> {
         let stream = timeout(
             TUNNEL_ENDPOINT_CONNECT_TIMEOUT,
             TcpStream::connect((self.outbound.server.as_str(), self.outbound.port)),
@@ -259,34 +431,7 @@ impl TunnelClient {
             "tunnel upgrade accepted"
         );
 
-        let payload = encode_tcp_connect_payload(target_host, target_port)
-            .map_err(|err| anyhow!("failed to encode tcp connect payload: {err}"))?;
-        write_frame(&mut stream, FrameType::TcpConnect, STREAM_ID, 0, payload).await?;
-
-        let connect_reply = timeout(TCP_CONNECT_REPLY_TIMEOUT, read_frame(&mut stream))
-            .await
-            .context("timed out waiting for TCP_CONNECT reply")??;
-        if connect_reply.stream_id != STREAM_ID {
-            bail!(
-                "unexpected stream id in connect reply: {}",
-                connect_reply.stream_id
-            );
-        }
-
-        match connect_reply.frame_type {
-            FrameType::TcpConnect if (connect_reply.flags & CONNECT_OK_FLAG) != 0 => Ok(stream),
-            FrameType::ErrorFrame => {
-                let message = String::from_utf8_lossy(connect_reply.payload.as_ref()).into_owned();
-                bail!("server refused TCP_CONNECT: {message}");
-            }
-            FrameType::TcpConnect => {
-                bail!(
-                    "server returned TCP_CONNECT without success flag; flags={}",
-                    connect_reply.flags
-                );
-            }
-            other => bail!("unexpected frame type instead of connect reply: {other}"),
-        }
+        Ok(stream)
     }
 }
 

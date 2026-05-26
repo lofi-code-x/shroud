@@ -14,6 +14,9 @@ pub enum FrameType {
     TcpConnect = 0x10,
     TcpData = 0x11,
     TcpClose = 0x12,
+    UdpDatagram = 0x30,
+    UdpAssociateRequest = 0x31,
+    UdpAssociateResponse = 0x32,
     Ping = 0x20,
     Pong = 0x21,
     ErrorFrame = 0x7F,
@@ -29,6 +32,9 @@ impl TryFrom<u8> for FrameType {
             0x10 => Self::TcpConnect,
             0x11 => Self::TcpData,
             0x12 => Self::TcpClose,
+            0x30 => Self::UdpDatagram,
+            0x31 => Self::UdpAssociateRequest,
+            0x32 => Self::UdpAssociateResponse,
             0x20 => Self::Ping,
             0x21 => Self::Pong,
             0x7F => Self::ErrorFrame,
@@ -140,8 +146,14 @@ pub enum ProtocolError {
     FramePayloadTooLarge { max: usize, got: usize },
     #[error("invalid connect payload: {0}")]
     InvalidConnectPayload(&'static str),
+    #[error("invalid udp datagram payload: {0}")]
+    InvalidUdpDatagramPayload(&'static str),
+    #[error("invalid udp associate response payload: {0}")]
+    InvalidUdpAssociateResponsePayload(&'static str),
     #[error("domain is too long for protocol: {0} bytes")]
     DomainTooLong(usize),
+    #[error("udp datagram payload is too large: max={max}, got={got}")]
+    UdpDatagramPayloadTooLarge { max: usize, got: usize },
 }
 
 impl fmt::Display for FrameType {
@@ -152,6 +164,9 @@ impl fmt::Display for FrameType {
             Self::TcpConnect => write!(f, "TCP_CONNECT"),
             Self::TcpData => write!(f, "TCP_DATA"),
             Self::TcpClose => write!(f, "TCP_CLOSE"),
+            Self::UdpDatagram => write!(f, "UDP_DATAGRAM"),
+            Self::UdpAssociateRequest => write!(f, "UDP_ASSOCIATE_REQUEST"),
+            Self::UdpAssociateResponse => write!(f, "UDP_ASSOCIATE_RESPONSE"),
             Self::Ping => write!(f, "PING"),
             Self::Pong => write!(f, "PONG"),
             Self::ErrorFrame => write!(f, "ERROR"),
@@ -159,9 +174,153 @@ impl fmt::Display for FrameType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpDatagram {
+    pub target_host: String,
+    pub target_port: u16,
+    pub payload: Bytes,
+    pub association_id: Option<u64>,
+}
+
+const UDP_DATAGRAM_ASSOCIATION_ID_FLAG: u8 = 0x01;
+
 pub fn encode_tcp_connect_payload(host: &str, port: u16) -> Result<Bytes, ProtocolError> {
     let mut payload = BytesMut::new();
 
+    encode_target_addr(host, &mut payload)?;
+    payload.put_u16(port);
+    Ok(payload.freeze())
+}
+
+pub fn decode_tcp_connect_payload(payload: &[u8]) -> Result<(String, u16), ProtocolError> {
+    if payload.len() < 3 {
+        return Err(ProtocolError::InvalidConnectPayload("payload too short"));
+    }
+
+    let (host, cursor) = decode_target_addr(payload, 0, ProtocolError::InvalidConnectPayload)?;
+
+    if payload.len() != cursor + 2 {
+        return Err(ProtocolError::InvalidConnectPayload(
+            "payload has unexpected trailing bytes",
+        ));
+    }
+
+    let port = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
+    Ok((host, port))
+}
+
+pub fn encode_udp_associate_response_payload(
+    bind_host: &str,
+    bind_port: u16,
+) -> Result<Bytes, ProtocolError> {
+    let mut payload = BytesMut::new();
+
+    encode_target_addr(bind_host, &mut payload)?;
+    payload.put_u16(bind_port);
+    Ok(payload.freeze())
+}
+
+pub fn decode_udp_associate_response_payload(
+    payload: &[u8],
+) -> Result<(String, u16), ProtocolError> {
+    if payload.len() < 3 {
+        return Err(ProtocolError::InvalidUdpAssociateResponsePayload(
+            "payload too short",
+        ));
+    }
+
+    let (host, cursor) = decode_target_addr(
+        payload,
+        0,
+        ProtocolError::InvalidUdpAssociateResponsePayload,
+    )?;
+
+    if payload.len() != cursor + 2 {
+        return Err(ProtocolError::InvalidUdpAssociateResponsePayload(
+            "payload has unexpected trailing bytes",
+        ));
+    }
+
+    let port = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
+    Ok((host, port))
+}
+
+pub fn encode_udp_datagram(datagram: &UdpDatagram) -> Result<Bytes, ProtocolError> {
+    let mut payload = BytesMut::new();
+    let flags = if datagram.association_id.is_some() {
+        UDP_DATAGRAM_ASSOCIATION_ID_FLAG
+    } else {
+        0
+    };
+    payload.put_u8(flags);
+
+    if let Some(association_id) = datagram.association_id {
+        payload.put_u64(association_id);
+    }
+
+    encode_target_addr(&datagram.target_host, &mut payload)?;
+    payload.put_u16(datagram.target_port);
+    payload.extend_from_slice(&datagram.payload);
+
+    if payload.len() > MAX_FRAME_PAYLOAD_LEN {
+        return Err(ProtocolError::UdpDatagramPayloadTooLarge {
+            max: MAX_FRAME_PAYLOAD_LEN,
+            got: payload.len(),
+        });
+    }
+
+    Ok(payload.freeze())
+}
+
+pub fn decode_udp_datagram(payload: &[u8]) -> Result<UdpDatagram, ProtocolError> {
+    let flags = *payload
+        .first()
+        .ok_or(ProtocolError::InvalidUdpDatagramPayload(
+            "payload too short",
+        ))?;
+    if flags & !UDP_DATAGRAM_ASSOCIATION_ID_FLAG != 0 {
+        return Err(ProtocolError::InvalidUdpDatagramPayload(
+            "unknown udp datagram flags",
+        ));
+    }
+
+    let mut cursor = 1usize;
+    let association_id = if flags & UDP_DATAGRAM_ASSOCIATION_ID_FLAG != 0 {
+        if payload.len() < cursor + 8 {
+            return Err(ProtocolError::InvalidUdpDatagramPayload(
+                "missing association id",
+            ));
+        }
+        let id = u64::from_be_bytes(
+            payload[cursor..cursor + 8]
+                .try_into()
+                .expect("slice length checked"),
+        );
+        cursor += 8;
+        Some(id)
+    } else {
+        None
+    };
+
+    let (target_host, cursor) =
+        decode_target_addr(payload, cursor, ProtocolError::InvalidUdpDatagramPayload)?;
+    if payload.len() < cursor + 2 {
+        return Err(ProtocolError::InvalidUdpDatagramPayload(
+            "missing target port",
+        ));
+    }
+    let target_port = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
+    let cursor = cursor + 2;
+
+    Ok(UdpDatagram {
+        target_host,
+        target_port,
+        payload: Bytes::copy_from_slice(&payload[cursor..]),
+        association_id,
+    })
+}
+
+fn encode_target_addr(host: &str, payload: &mut BytesMut) -> Result<(), ProtocolError> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(addr) => {
@@ -184,24 +343,22 @@ pub fn encode_tcp_connect_payload(host: &str, port: u16) -> Result<Bytes, Protoc
         payload.extend_from_slice(host_bytes);
     }
 
-    payload.put_u16(port);
-    Ok(payload.freeze())
+    Ok(())
 }
 
-pub fn decode_tcp_connect_payload(payload: &[u8]) -> Result<(String, u16), ProtocolError> {
-    if payload.len() < 3 {
-        return Err(ProtocolError::InvalidConnectPayload("payload too short"));
-    }
-
-    let addr_type = AddressType::try_from(payload[0])?;
-    let mut cursor = 1usize;
+fn decode_target_addr(
+    payload: &[u8],
+    start: usize,
+    invalid: fn(&'static str) -> ProtocolError,
+) -> Result<(String, usize), ProtocolError> {
+    let addr_type = *payload.get(start).ok_or(invalid("missing address type"))?;
+    let addr_type = AddressType::try_from(addr_type)?;
+    let mut cursor = start + 1;
 
     let host = match addr_type {
         AddressType::Ipv4 => {
-            if payload.len() < cursor + 4 + 2 {
-                return Err(ProtocolError::InvalidConnectPayload(
-                    "ipv4 payload shorter than expected",
-                ));
+            if payload.len() < cursor + 4 {
+                return Err(invalid("ipv4 payload shorter than expected"));
             }
             let mut raw = [0u8; 4];
             raw.copy_from_slice(&payload[cursor..cursor + 4]);
@@ -209,10 +366,8 @@ pub fn decode_tcp_connect_payload(payload: &[u8]) -> Result<(String, u16), Proto
             IpAddr::V4(Ipv4Addr::from(raw)).to_string()
         }
         AddressType::Ipv6 => {
-            if payload.len() < cursor + 16 + 2 {
-                return Err(ProtocolError::InvalidConnectPayload(
-                    "ipv6 payload shorter than expected",
-                ));
+            if payload.len() < cursor + 16 {
+                return Err(invalid("ipv6 payload shorter than expected"));
             }
             let mut raw = [0u8; 16];
             raw.copy_from_slice(&payload[cursor..cursor + 16]);
@@ -222,31 +377,20 @@ pub fn decode_tcp_connect_payload(payload: &[u8]) -> Result<(String, u16), Proto
         AddressType::Domain => {
             let domain_len = *payload
                 .get(cursor)
-                .ok_or(ProtocolError::InvalidConnectPayload(
-                    "missing domain length",
-                ))? as usize;
+                .ok_or(invalid("missing domain length"))? as usize;
             cursor += 1;
-            if payload.len() < cursor + domain_len + 2 {
-                return Err(ProtocolError::InvalidConnectPayload(
-                    "domain payload shorter than expected",
-                ));
+            if payload.len() < cursor + domain_len {
+                return Err(invalid("domain payload shorter than expected"));
             }
             let domain_raw = &payload[cursor..cursor + domain_len];
             cursor += domain_len;
             std::str::from_utf8(domain_raw)
-                .map_err(|_| ProtocolError::InvalidConnectPayload("domain is not valid utf-8"))?
+                .map_err(|_| invalid("domain is not valid utf-8"))?
                 .to_string()
         }
     };
 
-    if payload.len() != cursor + 2 {
-        return Err(ProtocolError::InvalidConnectPayload(
-            "payload has unexpected trailing bytes",
-        ));
-    }
-
-    let port = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]);
-    Ok((host, port))
+    Ok((host, cursor))
 }
 
 #[cfg(test)]
@@ -346,5 +490,78 @@ mod tests {
         let (host, port) = decode_tcp_connect_payload(payload.as_ref()).expect("decode");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn roundtrip_udp_associate_response_payload_ipv4() {
+        let payload = encode_udp_associate_response_payload("127.0.0.1", 49152).expect("encode");
+        let (host, port) = decode_udp_associate_response_payload(payload.as_ref()).expect("decode");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 49152);
+    }
+
+    #[test]
+    fn roundtrip_udp_datagram_domain_without_association() {
+        let datagram = UdpDatagram {
+            target_host: "example.com".to_string(),
+            target_port: 53,
+            payload: Bytes::from_static(b"dns"),
+            association_id: None,
+        };
+
+        let encoded = encode_udp_datagram(&datagram).expect("encode");
+        let decoded = decode_udp_datagram(encoded.as_ref()).expect("decode");
+
+        assert_eq!(decoded, datagram);
+    }
+
+    #[test]
+    fn roundtrip_udp_datagram_ipv4_with_association() {
+        let datagram = UdpDatagram {
+            target_host: "192.0.2.10".to_string(),
+            target_port: 443,
+            payload: Bytes::from_static(b"payload"),
+            association_id: Some(42),
+        };
+
+        let encoded = encode_udp_datagram(&datagram).expect("encode");
+        let decoded = decode_udp_datagram(encoded.as_ref()).expect("decode");
+
+        assert_eq!(decoded, datagram);
+    }
+
+    #[test]
+    fn roundtrip_udp_datagram_ipv6() {
+        let datagram = UdpDatagram {
+            target_host: "2001:db8::1".to_string(),
+            target_port: 5353,
+            payload: Bytes::from_static(b"payload"),
+            association_id: None,
+        };
+
+        let encoded = encode_udp_datagram(&datagram).expect("encode");
+        let decoded = decode_udp_datagram(encoded.as_ref()).expect("decode");
+
+        assert_eq!(decoded, datagram);
+    }
+
+    #[test]
+    fn decode_udp_datagram_rejects_unknown_flags() {
+        let payload = Bytes::from_static(b"\x02");
+        let err = decode_udp_datagram(payload.as_ref()).expect_err("unknown flags must fail");
+        assert!(matches!(
+            err,
+            ProtocolError::InvalidUdpDatagramPayload("unknown udp datagram flags")
+        ));
+    }
+
+    #[test]
+    fn decode_udp_datagram_rejects_truncated_association_id() {
+        let payload = Bytes::from_static(b"\x01\x00\x00");
+        let err = decode_udp_datagram(payload.as_ref()).expect_err("truncated id must fail");
+        assert!(matches!(
+            err,
+            ProtocolError::InvalidUdpDatagramPayload("missing association id")
+        ));
     }
 }

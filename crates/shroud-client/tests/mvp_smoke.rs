@@ -12,9 +12,9 @@ use shroud_core::protocol::{
 };
 use shroud_server::web;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
@@ -166,6 +166,37 @@ async fn socks_tls_tunnel_preserves_half_close_response() -> TestResult {
 
     let response = read_bytes_to_end(&mut stream).await?;
     assert_eq!(response, b"response after client half-close");
+    Ok(())
+}
+
+#[tokio::test]
+async fn socks_udp_associate_relays_datagrams_through_tunnel() -> TestResult {
+    let target = start_udp_echo_target().await?;
+    let server = start_tunnel_server().await?;
+    let client = start_socks_client(
+        server.addr,
+        RoutingConfig {
+            default: RouteAction::Proxy,
+            rules: vec![],
+        },
+        "/api/tunnel",
+        CLIENT_SECRET,
+    )
+    .await?;
+
+    let (_control, udp_proxy_addr) = socks_udp_associate(client.addr).await?;
+    let udp_client = UdpSocket::bind("127.0.0.1:0").await?;
+    let request = socks5::encode_udp_response_packet("127.0.0.1", target.addr.port(), b"udp ping")?;
+
+    udp_client.send_to(request.as_ref(), udp_proxy_addr).await?;
+
+    let mut buf = [0u8; 1024];
+    let (n, _source) = timeout(Duration::from_secs(5), udp_client.recv_from(&mut buf)).await??;
+    let response = socks5::decode_udp_request_packet(&buf[..n])?.expect("not fragmented");
+
+    assert_eq!(response.target_host, "127.0.0.1");
+    assert_eq!(response.target_port, target.addr.port());
+    assert_eq!(response.payload, Bytes::from_static(b"udp ping"));
     Ok(())
 }
 
@@ -701,6 +732,22 @@ async fn start_respond_after_eof_target(response: &'static [u8]) -> TestResult<R
     Ok(RunningTask { addr, handle })
 }
 
+async fn start_udp_echo_target() -> TestResult<RunningTask> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let addr = socket.local_addr()?;
+    let handle = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+                break;
+            };
+            let _ = socket.send_to(&buf[..n], peer).await;
+        }
+    });
+
+    Ok(RunningTask { addr, handle })
+}
+
 async fn start_fake_tunnel_server<F, Fut>(handler: F) -> TestResult<RunningTask>
 where
     F: FnOnce(TcpStream) -> Fut + Send + 'static,
@@ -781,6 +828,45 @@ async fn socks_connect_reply_code(proxy_addr: SocketAddr, host: &str, port: u16)
     Ok(reply[1])
 }
 
+async fn socks_udp_associate(proxy_addr: SocketAddr) -> TestResult<(TcpStream, SocketAddr)> {
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+
+    let mut handshake = [0u8; 2];
+    stream.read_exact(&mut handshake).await?;
+    assert_eq!(handshake, [0x05, 0x00], "SOCKS handshake failed");
+
+    stream
+        .write_all(&build_socks_udp_associate_request("0.0.0.0", 0)?)
+        .await?;
+
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await?;
+    assert_eq!(header[0], 0x05, "unexpected SOCKS reply version");
+    assert_eq!(header[1], 0x00, "SOCKS UDP ASSOCIATE failed");
+    assert_eq!(header[2], 0x00, "unexpected SOCKS reply reserved byte");
+
+    let bind_ip = match header[3] {
+        0x01 => {
+            let mut raw = [0u8; 4];
+            stream.read_exact(&mut raw).await?;
+            IpAddr::V4(Ipv4Addr::from(raw))
+        }
+        0x04 => {
+            let mut raw = [0u8; 16];
+            stream.read_exact(&mut raw).await?;
+            IpAddr::V6(Ipv6Addr::from(raw))
+        }
+        other => return Err(format!("unexpected UDP ASSOCIATE BND.ADDR type {other:#04x}").into()),
+    };
+    let mut port = [0u8; 2];
+    stream.read_exact(&mut port).await?;
+    let bind_addr = SocketAddr::new(bind_ip, u16::from_be_bytes(port));
+    assert_ne!(bind_addr.port(), 0, "SOCKS UDP bind port must be non-zero");
+
+    Ok((stream, bind_addr))
+}
+
 fn build_socks_connect_request(host: &str, port: u16) -> TestResult<Vec<u8>> {
     let mut request = vec![0x05, 0x01, 0x00];
     if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
@@ -799,6 +885,12 @@ fn build_socks_connect_request(host: &str, port: u16) -> TestResult<Vec<u8>> {
         request.extend_from_slice(host_bytes);
     }
     request.extend_from_slice(&port.to_be_bytes());
+    Ok(request)
+}
+
+fn build_socks_udp_associate_request(host: &str, port: u16) -> TestResult<Vec<u8>> {
+    let mut request = build_socks_connect_request(host, port)?;
+    request[1] = 0x03;
     Ok(request)
 }
 

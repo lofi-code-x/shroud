@@ -1,5 +1,5 @@
 use crate::routing::Router;
-use crate::tunnel::{RelayStats, TunnelClient, TunnelStream};
+use crate::tunnel::{RelayStats, TunnelClient, TunnelStream, UdpTunnel};
 use anyhow::{Context, Result};
 use shroud_core::config::{ClientDnsConfig, RouteAction};
 use std::net::{IpAddr, SocketAddr};
@@ -103,6 +103,13 @@ impl SessionCore {
             }
             RouteAction::Block => Ok(TcpOpenResult::Blocked),
         }
+    }
+
+    pub async fn open_udp_tunnel(&self) -> Result<UdpTunnel> {
+        self.tunnel
+            .open_udp_association()
+            .await
+            .context("proxy UDP associate failed")
     }
 
     pub async fn relay_tcp<S>(
