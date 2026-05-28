@@ -2,7 +2,7 @@
 
 Shroud is an experimental Rust client/server tunneling project.
 
-The current implementation provides local client inbounds, an authenticated tunnel transport to a remote server, and server-side TCP/UDP relay to the requested target. The main stable path is **SOCKS5 TCP CONNECT over an HTTP/1.1 Upgrade tunnel**, optionally protected by TLS. SOCKS5 `UDP ASSOCIATE` is implemented for proxied UDP datagrams.
+The current implementation provides local client inbounds, an authenticated tunnel transport to a remote server, and server-side TCP/UDP relay to the requested target. The main stable path is **SOCKS5 TCP CONNECT over an HTTP/1.1 Upgrade tunnel**, optionally protected by TLS. SOCKS TCP can run either as one tunnel connection per TCP stream or through an experimental persistent multiplexed tunnel. SOCKS5 `UDP ASSOCIATE` is implemented for proxied UDP datagrams on the non-multiplexed tunnel path.
 
 The project also contains an early Linux **TUN mode** backed by `netstack-smoltcp`. TUN currently targets controlled beta/smoke-test scenarios and is not yet a full VPN replacement.
 
@@ -31,6 +31,13 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
   - oversized frame rejection before payload allocation;
   - TCP stream frames;
   - UDP association and UDP datagram frames.
+- TCP multiplexing:
+  - optional client-side `outbound.multiplex`;
+  - optional server-side `multiplex.enabled`;
+  - one persistent physical tunnel can carry multiple logical TCP streams;
+  - logical TCP streams use odd client-allocated `stream_id` values;
+  - per-stream `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` dispatch;
+  - basic active-stream and writer-channel wait logging.
 - Authentication:
   - `client_id` / `client_secret` based auth header;
   - timestamp validation;
@@ -71,6 +78,7 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
   - SOCKS/TLS tunnel integration tests;
   - SOCKS UDP ASSOCIATE integration test;
   - server-side UDP relay integration test;
+  - multiplexed tunnel unit tests and an ignored multi-stream socket test;
   - large payload relay test;
   - half-close behavior test;
   - timeout/error-path tests;
@@ -81,7 +89,9 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
 - Direct UDP routing from the SOCKS inbound.
 - TUN UDP forwarding.
 - Browser DoH/DoT interception.
-- Multiplexing of multiple logical streams over one tunnel connection.
+- Multiplexed UDP associations.
+- Multiple physical tunnels / tunnel pool for multiplexing.
+- Automatic reconnect / keepalive for persistent multiplexed tunnels.
 - WebSocket transport.
 - HTTP/2 transport.
 - QUIC / HTTP/3 transport.
@@ -99,6 +109,7 @@ shroud-client
         |
         | HTTP/1.1 Upgrade + Shroud frames
         | optional TLS
+        | optional TCP multiplexing
         v
 shroud-server
         |
@@ -163,6 +174,7 @@ outbound:
   tls: true
   tls_server_name: "localhost"
   tls_ca_cert_path: "certs/ca.crt"
+  multiplex: true
 
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
@@ -199,9 +211,13 @@ tls:
 clients:
   - client_id: "11111111-1111-1111-1111-111111111111"
     client_secret: "replace-with-random-secret"
+multiplex:
+  enabled: true
 ```
 
 The checked-in example configs expect certificate files under `certs/` relative to the workspace root. If that directory is absent, either create/copy development certificates there or change the paths in `configs/client.yaml` and `configs/server.yaml`.
+
+`outbound.multiplex` and `multiplex.enabled` must be configured consistently for the intended tunnel mode. The checked-in configs enable the experimental TCP multiplexed mode.
 
 ## Generate client credentials
 
@@ -306,6 +322,42 @@ curl -v --socks5-hostname 127.0.0.1:1080 https://example.com/
 Use `--socks5-hostname`, not `--socks5`, when you want the domain name to be sent through the tunnel and resolved remotely by the server side.
 
 This is the primary MVP scenario.
+
+### SOCKS5 TCP multiplexing
+
+TCP multiplexing is available for SOCKS5 `CONNECT` proxy routes. When enabled, the client opens one persistent physical HTTP Upgrade tunnel and sends multiple logical TCP streams over that connection using distinct `stream_id` values.
+
+Enable it on the client:
+
+```yaml
+outbound:
+  multiplex: true
+```
+
+Enable the matching server relay mode:
+
+```yaml
+multiplex:
+  enabled: true
+```
+
+Current behavior:
+
+- applies to proxied SOCKS TCP connections;
+- uses one persistent physical tunnel per client process;
+- creates logical streams with odd client-side `stream_id` values;
+- dispatches `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` per logical stream;
+- logs active stream counts and writer-channel send waits when the writer queue is under pressure.
+
+Current limitations:
+
+- no tunnel pool / multiple persistent physical tunnels yet;
+- no automatic reconnect for a broken persistent tunnel yet;
+- no client keepalive loop yet, although the server responds to `Ping` with `Pong`;
+- no multiplexed UDP associations;
+- no per-stream flow control or control-frame priority scheduling yet.
+
+Because the server chooses either the multiplexed relay or the non-multiplexed relay for the tunnel path, SOCKS5 `UDP ASSOCIATE` currently requires the non-multiplexed server mode. Disable both `outbound.multiplex` and `multiplex.enabled` when testing UDP ASSOCIATE.
 
 ### SOCKS5 UDP ASSOCIATE
 
@@ -475,7 +527,9 @@ The TUN smoke test is ignored by default because it requires Linux root privileg
 
 ## Protocol summary
 
-Each tunnel connection currently carries either one TCP stream or one UDP association. Multiplexing multiple logical streams or associations over one tunnel connection is not implemented yet.
+In non-multiplexed mode, each tunnel connection carries either one TCP stream or one UDP association.
+
+In multiplexed mode, one persistent tunnel connection carries multiple logical TCP streams. UDP associations are not multiplexed yet.
 
 Frame header:
 
@@ -497,7 +551,7 @@ Important frame types:
 - `UdpAssociateResponse` — acknowledge the UDP association and return the remote UDP bind address;
 - `UdpDatagram` — relay one UDP datagram with target/source address metadata;
 - `ErrorFrame` — report tunnel or target connection failure;
-- `Ping` / `Pong` — reserved for keepalive-style behavior.
+- `Ping` / `Pong` — keepalive-style frames; the server responds to `Ping` in multiplexed mode, but the client does not yet run an automatic keepalive loop.
 
 Current hard limit:
 
@@ -521,6 +575,10 @@ MAX_FRAME_PAYLOAD_LEN = 64 KiB
 
 - Keep SOCKS5 TCP CONNECT as the main stable path.
 - Keep SOCKS5 UDP ASSOCIATE covered by integration tests and harden edge cases.
+- Stabilize the current one-physical-tunnel TCP multiplexing path:
+  - fix late-frame / stream lifecycle edge cases;
+  - add connect-result handling that preserves SOCKS success semantics;
+  - improve logging around stream target, active streams and writer queue pressure.
 - Keep HTTP/1.1 Upgrade transport until the TCP MVP is fully stable.
 - Continue hardening timeouts, frame validation and relay edge cases.
 - Keep `cargo test --workspace` as the default quality gate.
@@ -546,7 +604,9 @@ MAX_FRAME_PAYLOAD_LEN = 64 KiB
 - TUN UDP forwarding.
 - HTTP/2 transport.
 - QUIC / HTTP/3 transport.
-- Multiplexing.
+- Multiplex tunnel pool with several physical tunnels.
+- Multiplex reconnect / keepalive and better flow-control behavior.
+- Multiplexed UDP associations.
 - Egress IP / exit selection.
 - Better operational observability.
 
