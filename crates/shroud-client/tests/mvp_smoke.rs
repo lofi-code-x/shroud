@@ -776,6 +776,8 @@ fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
         multiplex: false,
         multiplex_tunnels: 4,
         max_streams_per_tunnel: 16,
+        keepalive_interval_secs: 20,
+        keepalive_timeout_secs: 10,
     }
 }
 
@@ -790,6 +792,8 @@ fn outbound_config_plain(server_addr: SocketAddr, path: &str) -> OutboundConfig 
         multiplex: false,
         multiplex_tunnels: 4,
         max_streams_per_tunnel: 16,
+        keepalive_interval_secs: 20,
+        keepalive_timeout_secs: 10,
     }
 }
 

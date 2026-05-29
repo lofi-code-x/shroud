@@ -23,17 +23,47 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITER_CHANNEL_CAPACITY: usize = 128;
 const STREAM_CHANNEL_CAPACITY: usize = 128;
 const WRITER_CHANNEL_SEND_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(1);
+const COPY_BUF_SIZE: usize = 32 * 1024;
+const DATA_FRAMES_BEFORE_CONTROL_CHECK: usize = 8;
+static NEXT_MULTIPLEX_TUNNEL_ID: AtomicU64 = AtomicU64::new(0);
 
 type TargetStreamTx = mpsc::Sender<Bytes>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    Open,
+    ClientWriteClosed,
+    TargetWriteClosed,
+    Closing,
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+struct StreamMeta {
+    stream_id: u64,
+    target_host: String,
+    target_port: u16,
+    created_at: Instant,
+    bytes_up: u64,
+    bytes_down: u64,
+}
+
+struct MultiplexStream {
+    tx_to_target: Option<TargetStreamTx>,
+    state: StreamState,
+    meta: StreamMeta,
+}
+
 #[derive(Clone)]
 struct WriterChannels {
+    tunnel_id: u64,
     control_tx: mpsc::Sender<FrameCommand>,
     data_tx: mpsc::Sender<FrameCommand>,
 }
 
 struct ServerTunnelState {
-    streams: Mutex<HashMap<u64, TargetStreamTx>>,
+    tunnel_id: u64,
+    streams: Mutex<HashMap<u64, MultiplexStream>>,
     writer_tx: WriterChannels,
     tunnel_closed: AtomicBool,
 }
@@ -42,18 +72,22 @@ pub async fn relay_multiplexed_tunnel<S>(tunnel_stream: S, peer: SocketAddr) -> 
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let tunnel_id = NEXT_MULTIPLEX_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
     let opened_at = Instant::now();
     let (read_half, write_half) = tokio::io::split(tunnel_stream);
-    let (writer_tx, control_rx, data_rx) = writer_channels(WRITER_CHANNEL_CAPACITY);
+    let (writer_tx, control_rx, data_rx) = writer_channels(tunnel_id, WRITER_CHANNEL_CAPACITY);
     let state = Arc::new(ServerTunnelState {
+        tunnel_id,
         streams: Mutex::new(HashMap::new()),
         writer_tx,
         tunnel_closed: AtomicBool::new(false),
     });
 
-    info!(%peer, "multiplexed physical tunnel opened");
+    info!(%peer, tunnel_id, "multiplexed physical tunnel opened");
 
-    let writer_task = tokio::spawn(server_tunnel_writer_loop(write_half, control_rx, data_rx));
+    let writer_task = tokio::spawn(server_tunnel_writer_loop(
+        tunnel_id, write_half, control_rx, data_rx,
+    ));
     let result = server_tunnel_reader_loop(read_half, Arc::clone(&state), peer).await;
 
     state.tunnel_closed.store(true, Ordering::Release);
@@ -64,15 +98,19 @@ where
     match &result {
         Ok(()) => info!(
             %peer,
+            tunnel_id,
             duration_ms = elapsed_millis(opened_at.elapsed()),
             active_streams,
+            close_reason = "remote_closed",
             "multiplexed physical tunnel closed"
         ),
         Err(err) => warn!(
             %peer,
+            tunnel_id,
             duration_ms = elapsed_millis(opened_at.elapsed()),
             active_streams,
             error = %err,
+            close_reason = "tunnel_broken",
             "multiplexed physical tunnel closed with error"
         ),
     }
@@ -116,13 +154,29 @@ where
                 dispatch_tcp_data_to_target(Arc::clone(&state), peer, frame).await?;
             }
             FrameType::TcpClose => {
-                let active_streams = remove_multiplexed_stream(&state, frame.stream_id).await;
-                debug!(
-                    %peer,
-                    stream_id = frame.stream_id,
-                    active_streams,
-                    "multiplexed TCP stream closed by peer"
-                );
+                match close_multiplexed_stream_client_write(&state, frame.stream_id).await {
+                    Some(snapshot) => debug!(
+                        %peer,
+                        tunnel_id = state.tunnel_id,
+                        stream_id = snapshot.meta.stream_id,
+                        target_host = %snapshot.meta.target_host,
+                        target_port = snapshot.meta.target_port,
+                        duration_ms = elapsed_millis(snapshot.meta.created_at.elapsed()),
+                        bytes_up = snapshot.meta.bytes_up,
+                        bytes_down = snapshot.meta.bytes_down,
+                        state = ?snapshot.state,
+                        active_streams = snapshot.active_streams,
+                        close_reason = "client_closed",
+                        "multiplexed TCP stream client write side closed"
+                    ),
+                    None => debug!(
+                        %peer,
+                        tunnel_id = state.tunnel_id,
+                        stream_id = frame.stream_id,
+                        close_reason = "client_closed",
+                        "ignoring TCP_CLOSE for unknown multiplexed stream"
+                    ),
+                }
             }
             FrameType::ErrorFrame => {
                 let message = String::from_utf8_lossy(frame.payload.as_ref()).into_owned();
@@ -145,6 +199,7 @@ where
                         payload: frame.payload,
                     },
                     "PONG",
+                    WriterLogContext::empty(),
                 )
                 .await
                 .context("failed to queue PONG for multiplexed tunnel")?;
@@ -162,13 +217,21 @@ where
 }
 
 async fn server_tunnel_writer_loop<W>(
+    tunnel_id: u64,
     mut write_half: tokio::io::WriteHalf<W>,
     mut control_rx: mpsc::Receiver<FrameCommand>,
     mut data_rx: mpsc::Receiver<FrameCommand>,
 ) where
     W: AsyncWrite + Unpin,
 {
-    while let Some(cmd) = recv_writer_command(&mut control_rx, &mut data_rx).await {
+    let mut data_frames_since_control_check = 0usize;
+    while let Some(cmd) = recv_writer_command(
+        &mut control_rx,
+        &mut data_rx,
+        &mut data_frames_since_control_check,
+    )
+    .await
+    {
         if let Err(err) = write_frame(
             &mut write_half,
             cmd.frame_type,
@@ -178,12 +241,17 @@ async fn server_tunnel_writer_loop<W>(
         )
         .await
         {
-            warn!(error = %err, "multiplexed tunnel writer stopped");
+            warn!(
+                tunnel_id,
+                error = %err,
+                close_reason = "tunnel_broken",
+                "multiplexed tunnel writer stopped"
+            );
             break;
         }
     }
 
-    debug!("multiplexed tunnel writer finished");
+    debug!(tunnel_id, "multiplexed tunnel writer finished");
 }
 
 async fn handle_multiplexed_tcp_connect(
@@ -198,6 +266,7 @@ async fn handle_multiplexed_tcp_connect(
     {
         let mut streams = state.streams.lock().await;
         if streams.contains_key(&stream_id) {
+            let active_streams = streams.len();
             drop(streams);
             send_writer_command(
                 &state.writer_tx,
@@ -208,13 +277,17 @@ async fn handle_multiplexed_tcp_connect(
                     payload: Bytes::from_static(b"duplicate stream id"),
                 },
                 "duplicate stream id ERROR",
+                WriterLogContext::target(&target_host, target_port, active_streams),
             )
             .await
             .context("failed to queue duplicate stream id error")?;
             return Ok(());
         }
 
-        streams.insert(stream_id, to_target_tx);
+        streams.insert(
+            stream_id,
+            MultiplexStream::new(stream_id, target_host.clone(), target_port, to_target_tx),
+        );
         debug!(
             %peer,
             stream_id,
@@ -242,20 +315,55 @@ async fn dispatch_tcp_data_to_target(
     peer: SocketAddr,
     frame: Frame,
 ) -> Result<()> {
-    let tx = {
+    let dispatch = {
         let streams = state.streams.lock().await;
-        streams.get(&frame.stream_id).cloned()
+        match streams.get(&frame.stream_id) {
+            Some(stream) if stream.state == StreamState::Open && stream.tx_to_target.is_some() => {
+                TcpDataDispatch::Open(stream.tx_to_target.as_ref().expect("checked").clone())
+            }
+            Some(stream) => TcpDataDispatch::Closing {
+                state: stream.state,
+                meta: stream.meta.clone(),
+                active_streams: streams.len(),
+            },
+            None => TcpDataDispatch::Unknown,
+        }
     };
 
-    let Some(tx) = tx else {
-        debug!(
-            %peer,
-            stream_id = frame.stream_id,
-            "dropping TCP_DATA for unknown multiplexed stream"
-        );
-        return Ok(());
+    let tx = match dispatch {
+        TcpDataDispatch::Open(tx) => tx,
+        TcpDataDispatch::Closing {
+            state,
+            meta,
+            active_streams,
+        } => {
+            debug!(
+                %peer,
+                stream_id = meta.stream_id,
+                target_host = %meta.target_host,
+                target_port = meta.target_port,
+                duration_ms = elapsed_millis(meta.created_at.elapsed()),
+                bytes_up = meta.bytes_up,
+                bytes_down = meta.bytes_down,
+                state = ?state,
+                active_streams,
+                payload_len = frame.payload.len(),
+                "late TCP_DATA for closing multiplexed stream ignored"
+            );
+            return Ok(());
+        }
+        TcpDataDispatch::Unknown => {
+            debug!(
+                %peer,
+                stream_id = frame.stream_id,
+                payload_len = frame.payload.len(),
+                "dropping TCP_DATA for unknown multiplexed stream"
+            );
+            return Ok(());
+        }
     };
 
+    let payload_len = frame.payload.len();
     if tx.send(frame.payload).await.is_err() {
         let active_streams = remove_multiplexed_stream(&state, frame.stream_id).await;
         debug!(
@@ -264,9 +372,21 @@ async fn dispatch_tcp_data_to_target(
             active_streams,
             "multiplexed TCP stream removed after target input closed"
         );
+    } else {
+        record_multiplexed_stream_bytes(&state, frame.stream_id, payload_len as u64, 0).await;
     }
 
     Ok(())
+}
+
+enum TcpDataDispatch {
+    Open(TargetStreamTx),
+    Closing {
+        state: StreamState,
+        meta: StreamMeta,
+        active_streams: usize,
+    },
+    Unknown,
 }
 
 async fn connect_and_relay_target(
@@ -301,6 +421,7 @@ async fn connect_and_relay_target(
             fail_multiplexed_stream(&state, stream_id, message).await;
             log_multiplexed_stream_closed(
                 peer,
+                state.tunnel_id,
                 stream_id,
                 &target_host,
                 target_port,
@@ -308,6 +429,7 @@ async fn connect_and_relay_target(
                 tunnel_to_target_bytes.load(Ordering::Relaxed),
                 target_to_tunnel_bytes.load(Ordering::Relaxed),
                 active_multiplexed_streams(&state).await,
+                "target_connect_failed",
             );
             return;
         }
@@ -320,6 +442,7 @@ async fn connect_and_relay_target(
                 fail_multiplexed_stream(&state, stream_id, message).await;
                 log_multiplexed_stream_closed(
                     peer,
+                    state.tunnel_id,
                     stream_id,
                     &target_host,
                     target_port,
@@ -327,6 +450,7 @@ async fn connect_and_relay_target(
                     tunnel_to_target_bytes.load(Ordering::Relaxed),
                     target_to_tunnel_bytes.load(Ordering::Relaxed),
                     active_multiplexed_streams(&state).await,
+                    "target_connect_failed",
                 );
                 return;
             }
@@ -357,6 +481,7 @@ async fn connect_and_relay_target(
             fail_multiplexed_stream(&state, stream_id, message).await;
             log_multiplexed_stream_closed(
                 peer,
+                state.tunnel_id,
                 stream_id,
                 &target_host,
                 target_port,
@@ -364,6 +489,7 @@ async fn connect_and_relay_target(
                 tunnel_to_target_bytes.load(Ordering::Relaxed),
                 target_to_tunnel_bytes.load(Ordering::Relaxed),
                 active_multiplexed_streams(&state).await,
+                "target_connect_failed",
             );
             return;
         }
@@ -379,6 +505,7 @@ async fn connect_and_relay_target(
         );
         log_multiplexed_stream_closed(
             peer,
+            state.tunnel_id,
             stream_id,
             &target_host,
             target_port,
@@ -386,10 +513,12 @@ async fn connect_and_relay_target(
             tunnel_to_target_bytes.load(Ordering::Relaxed),
             target_to_tunnel_bytes.load(Ordering::Relaxed),
             active_multiplexed_streams(&state).await,
+            "client_closed",
         );
         return;
     }
 
+    let active_streams = active_multiplexed_streams(&state).await;
     if send_writer_command(
         &state.writer_tx,
         FrameCommand {
@@ -399,6 +528,7 @@ async fn connect_and_relay_target(
             payload: Bytes::new(),
         },
         "TCP_CONNECT response",
+        WriterLogContext::target(&target_host, target_port, active_streams),
     )
     .await
     .is_err()
@@ -406,6 +536,7 @@ async fn connect_and_relay_target(
         remove_multiplexed_stream(&state, stream_id).await;
         log_multiplexed_stream_closed(
             peer,
+            state.tunnel_id,
             stream_id,
             &target_host,
             target_port,
@@ -413,6 +544,7 @@ async fn connect_and_relay_target(
             tunnel_to_target_bytes.load(Ordering::Relaxed),
             target_to_tunnel_bytes.load(Ordering::Relaxed),
             active_multiplexed_streams(&state).await,
+            "writer_channel_closed",
         );
         return;
     }
@@ -420,7 +552,10 @@ async fn connect_and_relay_target(
     let (target_read, target_write) = target_stream.into_split();
     let writer_tx = state.writer_tx.clone();
     let mut reader_task = tokio::spawn(target_reader_loop(
+        Arc::clone(&state),
         stream_id,
+        target_host.clone(),
+        target_port,
         target_read,
         writer_tx,
         Arc::clone(&target_to_tunnel_bytes),
@@ -432,7 +567,7 @@ async fn connect_and_relay_target(
         Arc::clone(&tunnel_to_target_bytes),
     ));
 
-    tokio::select! {
+    let close_reason = tokio::select! {
         result = &mut reader_task => {
             match result {
                 Ok(Ok(bytes)) => debug!(
@@ -441,6 +576,7 @@ async fn connect_and_relay_target(
                     target_host,
                     target_port,
                     target_to_tunnel_bytes = bytes,
+                    close_reason = "target_closed",
                     "multiplexed target reader finished"
                 ),
                 Ok(Err(err)) => debug!(
@@ -449,6 +585,7 @@ async fn connect_and_relay_target(
                     target_host,
                     target_port,
                     error = %err,
+                    close_reason = "target_closed",
                     "multiplexed target reader failed"
                 ),
                 Err(err) => debug!(
@@ -457,21 +594,33 @@ async fn connect_and_relay_target(
                     target_host,
                     target_port,
                     error = %err,
+                    close_reason = "target_closed",
                     "multiplexed target reader task failed"
                 ),
             }
-            remove_multiplexed_stream(&state, stream_id).await;
+            mark_multiplexed_stream_target_write_closed(&state, stream_id).await;
+            let active_streams = remove_multiplexed_stream(&state, stream_id).await;
             let _ = send_writer_command(&state.writer_tx, FrameCommand {
                 frame_type: FrameType::TcpClose,
                 stream_id,
                 flags: 0,
                 payload: Bytes::new(),
-            }, "TCP_CLOSE").await;
+            }, "TCP_CLOSE", WriterLogContext::target(
+                &target_host,
+                target_port,
+                active_streams,
+            )).await;
             writer_task.abort();
             let _ = writer_task.await;
+            "target_closed"
         }
         result = &mut writer_task => {
             let writer_finished_cleanly = matches!(result, Ok(Ok(_)));
+            let close_reason = if writer_finished_cleanly {
+                "client_closed"
+            } else {
+                "tunnel_broken"
+            };
             match result {
                 Ok(Ok(bytes)) => debug!(
                     %peer,
@@ -479,6 +628,7 @@ async fn connect_and_relay_target(
                     target_host,
                     target_port,
                     tunnel_to_target_bytes = bytes,
+                    close_reason,
                     "multiplexed target writer finished"
                 ),
                 Ok(Err(err)) => debug!(
@@ -487,6 +637,7 @@ async fn connect_and_relay_target(
                     target_host,
                     target_port,
                     error = %err,
+                    close_reason,
                     "multiplexed target writer failed"
                 ),
                 Err(err) => debug!(
@@ -495,6 +646,7 @@ async fn connect_and_relay_target(
                     target_host,
                     target_port,
                     error = %err,
+                    close_reason,
                     "multiplexed target writer task failed"
                 ),
             }
@@ -507,6 +659,7 @@ async fn connect_and_relay_target(
                         target_host,
                         target_port,
                         target_to_tunnel_bytes = bytes,
+                        close_reason,
                         "multiplexed target reader finished after input close"
                     ),
                     Ok(Err(err)) => debug!(
@@ -515,6 +668,7 @@ async fn connect_and_relay_target(
                         target_host,
                         target_port,
                         error = %err,
+                        close_reason,
                         "multiplexed target reader failed after input close"
                     ),
                     Err(err) => debug!(
@@ -523,26 +677,33 @@ async fn connect_and_relay_target(
                         target_host,
                         target_port,
                         error = %err,
+                        close_reason,
                         "multiplexed target reader task failed after input close"
                     ),
                 }
-                remove_multiplexed_stream(&state, stream_id).await;
+                let active_streams = remove_multiplexed_stream(&state, stream_id).await;
                 let _ = send_writer_command(&state.writer_tx, FrameCommand {
                     frame_type: FrameType::TcpClose,
                     stream_id,
                     flags: 0,
                     payload: Bytes::new(),
-                }, "TCP_CLOSE").await;
+                }, "TCP_CLOSE", WriterLogContext::target(
+                    &target_host,
+                    target_port,
+                    active_streams,
+                )).await;
             } else {
                 remove_multiplexed_stream(&state, stream_id).await;
                 reader_task.abort();
                 let _ = reader_task.await;
             }
+            close_reason
         }
-    }
+    };
 
     log_multiplexed_stream_closed(
         peer,
+        state.tunnel_id,
         stream_id,
         &target_host,
         target_port,
@@ -550,17 +711,21 @@ async fn connect_and_relay_target(
         tunnel_to_target_bytes.load(Ordering::Relaxed),
         target_to_tunnel_bytes.load(Ordering::Relaxed),
         active_multiplexed_streams(&state).await,
+        close_reason,
     );
 }
 
 async fn target_reader_loop(
+    state: Arc<ServerTunnelState>,
     stream_id: u64,
+    target_host: String,
+    target_port: u16,
     mut target_read: impl AsyncRead + Unpin,
     writer_tx: WriterChannels,
     transferred_counter: Arc<AtomicU64>,
 ) -> Result<u64> {
     let mut transferred = 0u64;
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; COPY_BUF_SIZE];
 
     loop {
         let n = timeout(RELAY_IDLE_TIMEOUT, target_read.read(&mut buf))
@@ -581,9 +746,15 @@ async fn target_reader_loop(
                 payload: Bytes::copy_from_slice(&buf[..n]),
             },
             "TCP_DATA",
+            WriterLogContext::target(
+                &target_host,
+                target_port,
+                active_multiplexed_streams(&state).await,
+            ),
         )
         .await
         .context("failed to queue TCP_DATA from target")?;
+        record_multiplexed_stream_bytes(&state, stream_id, 0, n as u64).await;
     }
 
     Ok(transferred)
@@ -612,7 +783,12 @@ async fn target_writer_loop(
 }
 
 async fn fail_multiplexed_stream(state: &Arc<ServerTunnelState>, stream_id: u64, message: String) {
+    let snapshot = multiplexed_stream_snapshot(state, stream_id).await;
     remove_multiplexed_stream(state, stream_id).await;
+    let log_context = snapshot
+        .as_ref()
+        .map(|snapshot| WriterLogContext::from_meta(&snapshot.meta, snapshot.active_streams))
+        .unwrap_or_else(WriterLogContext::empty);
     let _ = send_writer_command(
         &state.writer_tx,
         FrameCommand {
@@ -622,12 +798,95 @@ async fn fail_multiplexed_stream(state: &Arc<ServerTunnelState>, stream_id: u64,
             payload: Bytes::from(message),
         },
         "ERROR",
+        log_context,
     )
     .await;
 }
 
+struct StreamCloseSnapshot {
+    state: StreamState,
+    meta: StreamMeta,
+    active_streams: usize,
+}
+
+async fn multiplexed_stream_snapshot(
+    state: &Arc<ServerTunnelState>,
+    stream_id: u64,
+) -> Option<StreamCloseSnapshot> {
+    let streams = state.streams.lock().await;
+    streams.get(&stream_id).map(|stream| StreamCloseSnapshot {
+        state: stream.state,
+        meta: stream.meta.clone(),
+        active_streams: streams.len(),
+    })
+}
+
+async fn close_multiplexed_stream_client_write(
+    state: &Arc<ServerTunnelState>,
+    stream_id: u64,
+) -> Option<StreamCloseSnapshot> {
+    let (tx_to_drop, snapshot) = {
+        let mut streams = state.streams.lock().await;
+        let active_streams = streams.len();
+        let stream = streams.get_mut(&stream_id)?;
+
+        let tx_to_drop = stream.tx_to_target.take();
+        stream.state = match stream.state {
+            StreamState::Open => StreamState::ClientWriteClosed,
+            StreamState::TargetWriteClosed => StreamState::Closing,
+            StreamState::ClientWriteClosed | StreamState::Closing | StreamState::Closed => {
+                stream.state
+            }
+        };
+
+        (
+            tx_to_drop,
+            StreamCloseSnapshot {
+                state: stream.state,
+                meta: stream.meta.clone(),
+                active_streams,
+            },
+        )
+    };
+
+    drop(tx_to_drop);
+    Some(snapshot)
+}
+
+async fn mark_multiplexed_stream_target_write_closed(
+    state: &Arc<ServerTunnelState>,
+    stream_id: u64,
+) {
+    let mut streams = state.streams.lock().await;
+    if let Some(stream) = streams.get_mut(&stream_id) {
+        stream.state = match stream.state {
+            StreamState::Open => StreamState::TargetWriteClosed,
+            StreamState::ClientWriteClosed => StreamState::Closing,
+            StreamState::TargetWriteClosed | StreamState::Closing | StreamState::Closed => {
+                stream.state
+            }
+        };
+    }
+}
+
+async fn record_multiplexed_stream_bytes(
+    state: &Arc<ServerTunnelState>,
+    stream_id: u64,
+    bytes_up: u64,
+    bytes_down: u64,
+) {
+    let mut streams = state.streams.lock().await;
+    if let Some(stream) = streams.get_mut(&stream_id) {
+        stream.meta.bytes_up = stream.meta.bytes_up.saturating_add(bytes_up);
+        stream.meta.bytes_down = stream.meta.bytes_down.saturating_add(bytes_down);
+    }
+}
+
 async fn remove_multiplexed_stream(state: &Arc<ServerTunnelState>, stream_id: u64) -> usize {
     let mut streams = state.streams.lock().await;
+    if let Some(stream) = streams.get_mut(&stream_id) {
+        stream.state = StreamState::Closed;
+    }
     streams.remove(&stream_id);
     streams.len()
 }
@@ -651,14 +910,16 @@ async fn send_writer_command(
     writer_tx: &WriterChannels,
     cmd: FrameCommand,
     operation: &'static str,
+    log_context: WriterLogContext<'_>,
 ) -> Result<()> {
     let frame_type = cmd.frame_type;
     let stream_id = cmd.stream_id;
     let payload_len = cmd.payload.len();
+    let sender = writer_tx.sender_for(frame_type);
+    let queue = writer_queue_metrics(sender);
     let started = Instant::now();
 
-    writer_tx
-        .sender_for(frame_type)
+    sender
         .send(cmd)
         .await
         .with_context(|| format!("failed to queue {operation} for multiplexed tunnel"))?;
@@ -666,10 +927,17 @@ async fn send_writer_command(
     let wait = started.elapsed();
     if wait >= WRITER_CHANNEL_SEND_WAIT_LOG_THRESHOLD {
         debug!(
+            tunnel_id = writer_tx.tunnel_id,
             stream_id,
+            target_host = %log_context.target_host.unwrap_or("<unknown>"),
+            target_port = log_context.target_port.unwrap_or_default(),
             frame_type = %frame_type,
             payload_len,
+            writer_queue_capacity = queue.capacity,
+            writer_queue_available = queue.available,
+            writer_queue_depth = queue.depth,
             writer_channel_send_wait_ms = elapsed_millis(wait),
+            active_streams = log_context.active_streams.unwrap_or_default(),
             "multiplexed tunnel writer channel send waited"
         );
     }
@@ -677,7 +945,54 @@ async fn send_writer_command(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WriterLogContext<'a> {
+    target_host: Option<&'a str>,
+    target_port: Option<u16>,
+    active_streams: Option<usize>,
+}
+
+impl<'a> WriterLogContext<'a> {
+    fn empty() -> Self {
+        Self {
+            target_host: None,
+            target_port: None,
+            active_streams: None,
+        }
+    }
+
+    fn target(target_host: &'a str, target_port: u16, active_streams: usize) -> Self {
+        Self {
+            target_host: Some(target_host),
+            target_port: Some(target_port),
+            active_streams: Some(active_streams),
+        }
+    }
+
+    fn from_meta(meta: &'a StreamMeta, active_streams: usize) -> Self {
+        Self::target(&meta.target_host, meta.target_port, active_streams)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WriterQueueMetrics {
+    capacity: usize,
+    available: usize,
+    depth: usize,
+}
+
+fn writer_queue_metrics(sender: &mpsc::Sender<FrameCommand>) -> WriterQueueMetrics {
+    let capacity = sender.max_capacity();
+    let available = sender.capacity();
+    WriterQueueMetrics {
+        capacity,
+        available,
+        depth: capacity.saturating_sub(available),
+    }
+}
+
 fn writer_channels(
+    tunnel_id: u64,
     capacity: usize,
 ) -> (
     WriterChannels,
@@ -688,6 +1003,7 @@ fn writer_channels(
     let (data_tx, data_rx) = mpsc::channel(capacity);
     (
         WriterChannels {
+            tunnel_id,
             control_tx,
             data_tx,
         },
@@ -713,6 +1029,7 @@ fn is_control_frame(frame_type: FrameType) -> bool {
 async fn recv_writer_command(
     control_rx: &mut mpsc::Receiver<FrameCommand>,
     data_rx: &mut mpsc::Receiver<FrameCommand>,
+    data_frames_since_control_check: &mut usize,
 ) -> Option<FrameCommand> {
     let mut control_open = true;
     let mut data_open = true;
@@ -722,17 +1039,43 @@ async fn recv_writer_command(
             return None;
         }
 
+        if control_open {
+            match control_rx.try_recv() {
+                Ok(cmd) => {
+                    *data_frames_since_control_check = 0;
+                    return Some(cmd);
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => control_open = false,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        if *data_frames_since_control_check >= DATA_FRAMES_BEFORE_CONTROL_CHECK {
+            *data_frames_since_control_check = 0;
+            tokio::task::yield_now().await;
+            if control_open {
+                match control_rx.try_recv() {
+                    Ok(cmd) => return Some(cmd),
+                    Err(mpsc::error::TryRecvError::Disconnected) => control_open = false,
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+        }
+
         tokio::select! {
             biased;
 
             cmd = control_rx.recv(), if control_open => {
                 if let Some(cmd) = cmd {
+                    *data_frames_since_control_check = 0;
                     return Some(cmd);
                 }
                 control_open = false;
             }
             cmd = data_rx.recv(), if data_open => {
                 if let Some(cmd) = cmd {
+                    *data_frames_since_control_check =
+                        (*data_frames_since_control_check).saturating_add(1);
                     return Some(cmd);
                 }
                 data_open = false;
@@ -743,6 +1086,7 @@ async fn recv_writer_command(
 
 fn log_multiplexed_stream_closed(
     peer: SocketAddr,
+    tunnel_id: u64,
     stream_id: u64,
     target_host: &str,
     target_port: u16,
@@ -750,10 +1094,12 @@ fn log_multiplexed_stream_closed(
     bytes_up: u64,
     bytes_down: u64,
     active_streams: usize,
+    close_reason: &'static str,
 ) {
     let duration = opened_at.elapsed();
     debug!(
         %peer,
+        tunnel_id,
         stream_id,
         target_host,
         target_port,
@@ -762,8 +1108,31 @@ fn log_multiplexed_stream_closed(
         bytes_down,
         mbps = mbps(bytes_up + bytes_down, duration),
         active_streams,
+        close_reason,
         "multiplexed TCP stream closed"
     );
+}
+
+impl MultiplexStream {
+    fn new(
+        stream_id: u64,
+        target_host: String,
+        target_port: u16,
+        tx_to_target: TargetStreamTx,
+    ) -> Self {
+        Self {
+            tx_to_target: Some(tx_to_target),
+            state: StreamState::Open,
+            meta: StreamMeta {
+                stream_id,
+                target_host,
+                target_port,
+                created_at: Instant::now(),
+                bytes_up: 0,
+                bytes_down: 0,
+            },
+        }
+    }
 }
 
 pub async fn relay_tunnel<S>(mut tunnel_stream: S, peer: SocketAddr) -> Result<()>
@@ -938,7 +1307,7 @@ where
 
     let target_to_tunnel = async {
         let mut transferred = 0u64;
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = [0u8; COPY_BUF_SIZE];
 
         loop {
             let n = timeout(RELAY_IDLE_TIMEOUT, target_read.read(&mut buf))
@@ -1229,14 +1598,19 @@ mod tests {
 
     #[tokio::test]
     async fn multiplexed_dispatch_sends_tcp_data_to_registered_stream() -> Result<()> {
-        let (writer_tx, _control_rx, _data_rx) = writer_channels(1);
+        let (writer_tx, _control_rx, _data_rx) = writer_channels(0, 1);
         let state = Arc::new(ServerTunnelState {
+            tunnel_id: 0,
             streams: Mutex::new(HashMap::new()),
             writer_tx,
             tunnel_closed: AtomicBool::new(false),
         });
         let (stream_tx, mut stream_rx) = mpsc::channel(1);
-        state.streams.lock().await.insert(9, stream_tx);
+        state
+            .streams
+            .lock()
+            .await
+            .insert(9, test_stream(9, stream_tx));
         let peer = "127.0.0.1:12345".parse::<SocketAddr>()?;
 
         dispatch_tcp_data_to_target(
@@ -1260,14 +1634,19 @@ mod tests {
 
     #[tokio::test]
     async fn multiplexed_remove_stream_drops_target_input_sender() -> Result<()> {
-        let (writer_tx, _control_rx, _data_rx) = writer_channels(1);
+        let (writer_tx, _control_rx, _data_rx) = writer_channels(0, 1);
         let state = Arc::new(ServerTunnelState {
+            tunnel_id: 0,
             streams: Mutex::new(HashMap::new()),
             writer_tx,
             tunnel_closed: AtomicBool::new(false),
         });
         let (stream_tx, mut stream_rx) = mpsc::channel(1);
-        state.streams.lock().await.insert(21, stream_tx);
+        state
+            .streams
+            .lock()
+            .await
+            .insert(21, test_stream(21, stream_tx));
 
         remove_multiplexed_stream(&state, 21).await;
 
@@ -1278,22 +1657,101 @@ mod tests {
 
     #[tokio::test]
     async fn multiplexed_physical_tunnel_cleanup_drops_all_stream_inputs() -> Result<()> {
-        let (writer_tx, _control_rx, _data_rx) = writer_channels(1);
+        let (writer_tx, _control_rx, _data_rx) = writer_channels(0, 1);
         let state = Arc::new(ServerTunnelState {
+            tunnel_id: 0,
             streams: Mutex::new(HashMap::new()),
             writer_tx,
             tunnel_closed: AtomicBool::new(false),
         });
         let (first_tx, mut first_rx) = mpsc::channel(1);
         let (second_tx, mut second_rx) = mpsc::channel(1);
-        state.streams.lock().await.insert(23, first_tx);
-        state.streams.lock().await.insert(25, second_tx);
+        state
+            .streams
+            .lock()
+            .await
+            .insert(23, test_stream(23, first_tx));
+        state
+            .streams
+            .lock()
+            .await
+            .insert(25, test_stream(25, second_tx));
 
         state.streams.lock().await.clear();
 
         assert!(first_rx.recv().await.is_none());
         assert!(second_rx.recv().await.is_none());
         assert!(state.streams.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiplexed_client_close_keeps_stream_entry_until_target_finishes() -> Result<()> {
+        let (writer_tx, _control_rx, _data_rx) = writer_channels(0, 1);
+        let state = Arc::new(ServerTunnelState {
+            tunnel_id: 0,
+            streams: Mutex::new(HashMap::new()),
+            writer_tx,
+            tunnel_closed: AtomicBool::new(false),
+        });
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        state
+            .streams
+            .lock()
+            .await
+            .insert(29, test_stream(29, stream_tx));
+
+        let snapshot = close_multiplexed_stream_client_write(&state, 29)
+            .await
+            .expect("stream close snapshot");
+
+        assert_eq!(snapshot.state, StreamState::ClientWriteClosed);
+        assert!(stream_rx.recv().await.is_none());
+        assert!(is_multiplexed_stream_active(&state, 29).await);
+        assert_eq!(
+            state
+                .streams
+                .lock()
+                .await
+                .get(&29)
+                .map(|stream| stream.state),
+            Some(StreamState::ClientWriteClosed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiplexed_late_tcp_data_for_client_closed_stream_is_ignored() -> Result<()> {
+        let (writer_tx, _control_rx, _data_rx) = writer_channels(0, 1);
+        let state = Arc::new(ServerTunnelState {
+            tunnel_id: 0,
+            streams: Mutex::new(HashMap::new()),
+            writer_tx,
+            tunnel_closed: AtomicBool::new(false),
+        });
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        state
+            .streams
+            .lock()
+            .await
+            .insert(31, test_stream(31, stream_tx));
+        close_multiplexed_stream_client_write(&state, 31).await;
+        let peer = "127.0.0.1:12345".parse::<SocketAddr>()?;
+
+        dispatch_tcp_data_to_target(
+            Arc::clone(&state),
+            peer,
+            Frame {
+                frame_type: FrameType::TcpData,
+                stream_id: 31,
+                flags: 0,
+                payload: Bytes::from_static(b"late"),
+            },
+        )
+        .await?;
+
+        assert!(stream_rx.recv().await.is_none());
+        assert!(is_multiplexed_stream_active(&state, 31).await);
         Ok(())
     }
 
@@ -1318,8 +1776,10 @@ mod tests {
     async fn multiplexed_writer_loop_serializes_frame_commands() -> Result<()> {
         let (stream, mut peer) = duplex(1024);
         let (_read_half, write_half) = tokio::io::split(stream);
-        let (tx, control_rx, data_rx) = writer_channels(1);
-        let writer = tokio::spawn(server_tunnel_writer_loop(write_half, control_rx, data_rx));
+        let (tx, control_rx, data_rx) = writer_channels(0, 1);
+        let writer = tokio::spawn(server_tunnel_writer_loop(
+            0, write_half, control_rx, data_rx,
+        ));
 
         tx.data_tx
             .send(FrameCommand {
@@ -1342,7 +1802,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiplexed_writer_receive_prioritizes_control_over_data() -> Result<()> {
-        let (tx, mut control_rx, mut data_rx) = writer_channels(2);
+        let (tx, mut control_rx, mut data_rx) = writer_channels(0, 2);
 
         tx.data_tx
             .send(FrameCommand {
@@ -1361,9 +1821,14 @@ mod tests {
             })
             .await?;
 
-        let frame = recv_writer_command(&mut control_rx, &mut data_rx)
-            .await
-            .expect("writer command");
+        let mut data_frames_since_control_check = 0;
+        let frame = recv_writer_command(
+            &mut control_rx,
+            &mut data_rx,
+            &mut data_frames_since_control_check,
+        )
+        .await
+        .expect("writer command");
         assert_eq!(frame.frame_type, FrameType::TcpClose);
         Ok(())
     }
@@ -1503,5 +1968,9 @@ mod tests {
         relay_task.abort();
         let _ = relay_task.await;
         Ok(())
+    }
+
+    fn test_stream(stream_id: u64, tx_to_target: TargetStreamTx) -> MultiplexStream {
+        MultiplexStream::new(stream_id, "example.test".to_owned(), 443, tx_to_target)
     }
 }

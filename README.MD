@@ -177,6 +177,8 @@ outbound:
   multiplex: true
   multiplex_tunnels: 4
   max_streams_per_tunnel: 16
+  keepalive_interval_secs: 20
+  keepalive_timeout_secs: 10
 
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
@@ -336,6 +338,8 @@ outbound:
   multiplex: true
   multiplex_tunnels: 4
   max_streams_per_tunnel: 16
+  keepalive_interval_secs: 20
+  keepalive_timeout_secs: 10
 ```
 
 Enable the matching server relay mode:
@@ -349,16 +353,15 @@ Current behavior:
 
 - applies to proxied SOCKS TCP connections;
 - uses `outbound.multiplex_tunnels` persistent physical tunnels per client process, defaulting to 4;
-- chooses the tunnel with the fewest active streams, with `outbound.max_streams_per_tunnel` defaulting to 16 before fallback to the least-loaded tunnel;
+- chooses a connected tunnel by pressure score: active streams plus recent writer wait, with `outbound.max_streams_per_tunnel` defaulting to 16 before fallback to the least-pressured connected tunnel;
 - creates logical streams with odd client-side `stream_id` values;
 - dispatches `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` per logical stream;
-- uses separate control/data writer queues so control frames are preferred over `TcpData`;
+- uses separate control/data writer queues so control frames are preferred over `TcpData`, with periodic control checks after bounded data bursts;
+- sends client keepalive `Ping` frames and reconnects a broken persistent tunnel while excluding disconnected tunnels from new stream selection;
 - logs active stream counts and writer-channel send waits when the writer queue is under pressure.
 
 Current limitations:
 
-- no automatic reconnect for a broken persistent tunnel yet;
-- no client keepalive loop yet, although the server responds to `Ping` with `Pong`;
 - no multiplexed UDP associations;
 - no per-stream flow control yet.
 

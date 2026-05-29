@@ -21,6 +21,8 @@ outbound:
   multiplex: true
   multiplex_tunnels: 4
   max_streams_per_tunnel: 16
+  keepalive_interval_secs: 20
+  keepalive_timeout_secs: 10
 
 auth:
   client_id: "c1ce8312-7c35-4e70-867a-3af4ac7f68d7"

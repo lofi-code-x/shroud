@@ -125,6 +125,10 @@ pub struct OutboundConfig {
     pub multiplex_tunnels: usize,
     #[serde(default = "default_max_streams_per_tunnel")]
     pub max_streams_per_tunnel: usize,
+    #[serde(default = "default_keepalive_interval_secs")]
+    pub keepalive_interval_secs: u64,
+    #[serde(default = "default_keepalive_timeout_secs")]
+    pub keepalive_timeout_secs: u64,
 }
 
 impl Default for OutboundConfig {
@@ -139,6 +143,8 @@ impl Default for OutboundConfig {
             multiplex: false,
             multiplex_tunnels: default_multiplex_tunnels(),
             max_streams_per_tunnel: default_max_streams_per_tunnel(),
+            keepalive_interval_secs: default_keepalive_interval_secs(),
+            keepalive_timeout_secs: default_keepalive_timeout_secs(),
         }
     }
 }
@@ -149,6 +155,14 @@ fn default_multiplex_tunnels() -> usize {
 
 fn default_max_streams_per_tunnel() -> usize {
     16
+}
+
+fn default_keepalive_interval_secs() -> u64 {
+    20
+}
+
+fn default_keepalive_timeout_secs() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -503,6 +517,18 @@ fn validate_outbound_config(errors: &mut Vec<ConfigFieldError>, outbound: &Outbo
             "must be greater than 0",
         ));
     }
+    if outbound.keepalive_interval_secs == 0 {
+        errors.push(ConfigFieldError::new(
+            "outbound.keepalive_interval_secs",
+            "must be greater than 0",
+        ));
+    }
+    if outbound.keepalive_timeout_secs == 0 {
+        errors.push(ConfigFieldError::new(
+            "outbound.keepalive_timeout_secs",
+            "must be greater than 0",
+        ));
+    }
 }
 
 fn validate_client_auth_config(
@@ -706,6 +732,8 @@ auth:
 
         assert_eq!(cfg.outbound.multiplex_tunnels, 4);
         assert_eq!(cfg.outbound.max_streams_per_tunnel, 16);
+        assert_eq!(cfg.outbound.keepalive_interval_secs, 20);
+        assert_eq!(cfg.outbound.keepalive_timeout_secs, 10);
     }
 
     #[test]

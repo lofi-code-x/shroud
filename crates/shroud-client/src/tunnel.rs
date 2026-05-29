@@ -28,6 +28,7 @@ const HTTP_UPGRADE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_CONNECT_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_ASSOCIATE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const COPY_BUF_SIZE: usize = 32 * 1024;
 
 pub trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -252,7 +253,7 @@ impl TunnelClient {
 
         let client_to_upstream = async {
             let mut transferred = 0u64;
-            let mut buf = [0u8; 64 * 1024];
+            let mut buf = [0u8; COPY_BUF_SIZE];
 
             loop {
                 let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))

@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 const DIRECT_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const COPY_BUF_SIZE: usize = 32 * 1024;
 
 #[derive(Clone)]
 pub struct SessionCore {
@@ -196,7 +197,7 @@ where
 
     let client_to_upstream = async {
         let mut transferred = 0u64;
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = [0u8; COPY_BUF_SIZE];
 
         loop {
             let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))
@@ -220,7 +221,7 @@ where
 
     let upstream_to_client = async {
         let mut transferred = 0u64;
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = [0u8; COPY_BUF_SIZE];
 
         loop {
             let n = timeout(RELAY_IDLE_TIMEOUT, upstream_read.read(&mut buf))
@@ -268,7 +269,7 @@ where
 
     let client_to_tunnel = async {
         let mut transferred = 0u64;
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = [0u8; COPY_BUF_SIZE];
 
         loop {
             let n = timeout(RELAY_IDLE_TIMEOUT, client_read.read(&mut buf))
