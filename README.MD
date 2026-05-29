@@ -34,10 +34,16 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
 - TCP multiplexing:
   - optional client-side `outbound.multiplex`;
   - optional server-side `multiplex.enabled`;
-  - one persistent physical tunnel can carry multiple logical TCP streams;
+  - configurable pool of persistent physical tunnels via `outbound.multiplex_tunnels`;
+  - per-tunnel stream soft limit via `outbound.max_streams_per_tunnel`;
   - logical TCP streams use odd client-allocated `stream_id` values;
   - per-stream `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` dispatch;
-  - basic active-stream and writer-channel wait logging.
+  - client waits for server `TcpConnect` success before completing SOCKS `CONNECT`;
+  - server-side stream state tracks client/target close direction and ignores late `TcpData` for closing streams;
+  - separate control/data writer queues prioritize connect, close, error and keepalive frames over data frames;
+  - pressure-aware tunnel selection uses active stream count plus recent writer wait;
+  - client keepalive `Ping` / server `Pong` and reconnect of broken persistent tunnels;
+  - active-stream, target, tunnel, close-reason and writer-queue pressure logging.
 - Authentication:
   - `client_id` / `client_secret` based auth header;
   - timestamp validation;
@@ -90,8 +96,8 @@ The project also contains an early Linux **TUN mode** backed by `netstack-smoltc
 - TUN UDP forwarding.
 - Browser DoH/DoT interception.
 - Multiplexed UDP associations.
-- Multiple physical tunnels / tunnel pool for multiplexing.
-- Automatic reconnect / keepalive for persistent multiplexed tunnels.
+- Per-stream multiplex flow control.
+- Benchmark-driven multiplex frame-size tuning.
 - WebSocket transport.
 - HTTP/2 transport.
 - QUIC / HTTP/3 transport.
@@ -537,7 +543,7 @@ The TUN smoke test is ignored by default because it requires Linux root privileg
 
 In non-multiplexed mode, each tunnel connection carries either one TCP stream or one UDP association.
 
-In multiplexed mode, one persistent tunnel connection carries multiple logical TCP streams. UDP associations are not multiplexed yet.
+In multiplexed mode, each persistent tunnel connection carries multiple logical TCP streams. The client can open a pool of persistent tunnels and schedules new streams across connected tunnels. UDP associations are not multiplexed yet.
 
 Frame header:
 
@@ -559,7 +565,7 @@ Important frame types:
 - `UdpAssociateResponse` — acknowledge the UDP association and return the remote UDP bind address;
 - `UdpDatagram` — relay one UDP datagram with target/source address metadata;
 - `ErrorFrame` — report tunnel or target connection failure;
-- `Ping` / `Pong` — keepalive-style frames; the server responds to `Ping` in multiplexed mode, but the client does not yet run an automatic keepalive loop.
+- `Ping` / `Pong` — keepalive frames for persistent multiplexed tunnels; the client sends `Ping`, the server responds with `Pong`, and the client reconnects a tunnel when keepalive fails.
 
 Current hard limit:
 
@@ -583,10 +589,10 @@ MAX_FRAME_PAYLOAD_LEN = 64 KiB
 
 - Keep SOCKS5 TCP CONNECT as the main stable path.
 - Keep SOCKS5 UDP ASSOCIATE covered by integration tests and harden edge cases.
-- Stabilize the current one-physical-tunnel TCP multiplexing path:
-  - fix late-frame / stream lifecycle edge cases;
-  - add connect-result handling that preserves SOCKS success semantics;
-  - improve logging around stream target, active streams and writer queue pressure.
+- Continue stabilizing TCP multiplexing under browser/video workloads:
+  - benchmark `multiplex_tunnels=1/2/4/6` and tune defaults from measured writer waits;
+  - track late/unknown `TcpData` frequency under load;
+  - add per-stream or per-host throughput summaries where useful.
 - Keep HTTP/1.1 Upgrade transport until the TCP MVP is fully stable.
 - Continue hardening timeouts, frame validation and relay edge cases.
 - Keep `cargo test --workspace` as the default quality gate.
@@ -612,8 +618,7 @@ MAX_FRAME_PAYLOAD_LEN = 64 KiB
 - TUN UDP forwarding.
 - HTTP/2 transport.
 - QUIC / HTTP/3 transport.
-- Multiplex tunnel pool with several physical tunnels.
-- Multiplex reconnect / keepalive and better flow-control behavior.
+- Multiplex per-stream flow control and deeper fairness tuning.
 - Multiplexed UDP associations.
 - Egress IP / exit selection.
 - Better operational observability.
