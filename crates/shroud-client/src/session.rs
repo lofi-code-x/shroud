@@ -1,6 +1,6 @@
 use crate::routing::Router;
 use crate::tunnel::{RelayStats, TunnelClient, TunnelOpenTimings, TunnelStream, UdpTunnel};
-use crate::tunnel_manager::{TunnelManager, TunnelStreamHandle};
+use crate::tunnel_manager::{TunnelPool, TunnelStreamHandle};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use shroud_core::config::{ClientDnsConfig, RouteAction};
@@ -18,7 +18,7 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct SessionCore {
     router: Router,
     tunnel: TunnelClient,
-    tunnel_manager: Option<TunnelManager>,
+    tunnel_pool: Option<TunnelPool>,
     dns: ClientDnsConfig,
 }
 
@@ -27,7 +27,7 @@ impl SessionCore {
         Self {
             router,
             tunnel,
-            tunnel_manager: None,
+            tunnel_pool: None,
             dns,
         }
     }
@@ -35,13 +35,13 @@ impl SessionCore {
     pub fn new_multiplexed(
         router: Router,
         tunnel: TunnelClient,
-        tunnel_manager: TunnelManager,
+        tunnel_pool: TunnelPool,
         dns: ClientDnsConfig,
     ) -> Self {
         Self {
             router,
             tunnel,
-            tunnel_manager: Some(tunnel_manager),
+            tunnel_pool: Some(tunnel_pool),
             dns,
         }
     }
@@ -90,8 +90,8 @@ impl SessionCore {
 
         match action {
             RouteAction::Proxy => {
-                if let Some(tunnel_manager) = &self.tunnel_manager {
-                    let stream = tunnel_manager
+                if let Some(tunnel_pool) = &self.tunnel_pool {
+                    let stream = tunnel_pool
                         .open_tcp_stream(target_host, target_port)
                         .await
                         .context("proxy multiplexed tunnel connect failed")?;
@@ -259,6 +259,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let stream_id = stream.stream_id();
+    let tunnel_id = stream.tunnel_id();
     let target_host = stream.target_host().to_owned();
     let target_port = stream.target_port();
     let opened_at = stream.opened_at();
@@ -322,6 +323,7 @@ where
             };
 
             debug!(
+                tunnel_id,
                 stream_id,
                 target_host,
                 target_port,
@@ -329,7 +331,7 @@ where
                 bytes_up = stats.client_to_upstream_bytes,
                 bytes_down = stats.upstream_to_client_bytes,
                 mbps = stats.mbps(relay_elapsed),
-                active_streams,
+                active_streams_on_tunnel = active_streams,
                 "logical TCP stream closed"
             );
 
@@ -337,11 +339,12 @@ where
         }
         Err(err) => {
             debug!(
+                tunnel_id,
                 stream_id,
                 target_host,
                 target_port,
                 duration_ms = elapsed_millis(relay_elapsed),
-                active_streams,
+                active_streams_on_tunnel = active_streams,
                 error = %err,
                 "logical TCP stream closed with relay error"
             );

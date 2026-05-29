@@ -774,6 +774,8 @@ fn outbound_config(server_addr: SocketAddr, path: &str) -> OutboundConfig {
         tls_server_name: Some("localhost".to_string()),
         tls_ca_cert_path: Some(CA_CERT.to_string()),
         multiplex: false,
+        multiplex_tunnels: 4,
+        max_streams_per_tunnel: 16,
     }
 }
 
@@ -786,6 +788,8 @@ fn outbound_config_plain(server_addr: SocketAddr, path: &str) -> OutboundConfig 
         tls_server_name: None,
         tls_ca_cert_path: None,
         multiplex: false,
+        multiplex_tunnels: 4,
+        max_streams_per_tunnel: 16,
     }
 }
 

@@ -175,6 +175,8 @@ outbound:
   tls_server_name: "localhost"
   tls_ca_cert_path: "certs/ca.crt"
   multiplex: true
+  multiplex_tunnels: 4
+  max_streams_per_tunnel: 16
 
 auth:
   client_id: "11111111-1111-1111-1111-111111111111"
@@ -325,13 +327,15 @@ This is the primary MVP scenario.
 
 ### SOCKS5 TCP multiplexing
 
-TCP multiplexing is available for SOCKS5 `CONNECT` proxy routes. When enabled, the client opens one persistent physical HTTP Upgrade tunnel and sends multiple logical TCP streams over that connection using distinct `stream_id` values.
+TCP multiplexing is available for SOCKS5 `CONNECT` proxy routes. When enabled, the client opens a pool of persistent physical HTTP Upgrade tunnels and sends logical TCP streams over them using distinct `stream_id` values per tunnel.
 
 Enable it on the client:
 
 ```yaml
 outbound:
   multiplex: true
+  multiplex_tunnels: 4
+  max_streams_per_tunnel: 16
 ```
 
 Enable the matching server relay mode:
@@ -344,18 +348,19 @@ multiplex:
 Current behavior:
 
 - applies to proxied SOCKS TCP connections;
-- uses one persistent physical tunnel per client process;
+- uses `outbound.multiplex_tunnels` persistent physical tunnels per client process, defaulting to 4;
+- chooses the tunnel with the fewest active streams, with `outbound.max_streams_per_tunnel` defaulting to 16 before fallback to the least-loaded tunnel;
 - creates logical streams with odd client-side `stream_id` values;
 - dispatches `TcpConnect`, `TcpData`, `TcpClose` and `ErrorFrame` per logical stream;
+- uses separate control/data writer queues so control frames are preferred over `TcpData`;
 - logs active stream counts and writer-channel send waits when the writer queue is under pressure.
 
 Current limitations:
 
-- no tunnel pool / multiple persistent physical tunnels yet;
 - no automatic reconnect for a broken persistent tunnel yet;
 - no client keepalive loop yet, although the server responds to `Ping` with `Pong`;
 - no multiplexed UDP associations;
-- no per-stream flow control or control-frame priority scheduling yet.
+- no per-stream flow control yet.
 
 Because the server chooses either the multiplexed relay or the non-multiplexed relay for the tunnel path, SOCKS5 `UDP ASSOCIATE` currently requires the non-multiplexed server mode. Disable both `outbound.multiplex` and `multiplex.enabled` when testing UDP ASSOCIATE.
 

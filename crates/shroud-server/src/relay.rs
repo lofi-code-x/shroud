@@ -26,9 +26,15 @@ const WRITER_CHANNEL_SEND_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(1
 
 type TargetStreamTx = mpsc::Sender<Bytes>;
 
+#[derive(Clone)]
+struct WriterChannels {
+    control_tx: mpsc::Sender<FrameCommand>,
+    data_tx: mpsc::Sender<FrameCommand>,
+}
+
 struct ServerTunnelState {
     streams: Mutex<HashMap<u64, TargetStreamTx>>,
-    writer_tx: mpsc::Sender<FrameCommand>,
+    writer_tx: WriterChannels,
     tunnel_closed: AtomicBool,
 }
 
@@ -38,7 +44,7 @@ where
 {
     let opened_at = Instant::now();
     let (read_half, write_half) = tokio::io::split(tunnel_stream);
-    let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
+    let (writer_tx, control_rx, data_rx) = writer_channels(WRITER_CHANNEL_CAPACITY);
     let state = Arc::new(ServerTunnelState {
         streams: Mutex::new(HashMap::new()),
         writer_tx,
@@ -47,7 +53,7 @@ where
 
     info!(%peer, "multiplexed physical tunnel opened");
 
-    let writer_task = tokio::spawn(server_tunnel_writer_loop(write_half, writer_rx));
+    let writer_task = tokio::spawn(server_tunnel_writer_loop(write_half, control_rx, data_rx));
     let result = server_tunnel_reader_loop(read_half, Arc::clone(&state), peer).await;
 
     state.tunnel_closed.store(true, Ordering::Release);
@@ -157,11 +163,12 @@ where
 
 async fn server_tunnel_writer_loop<W>(
     mut write_half: tokio::io::WriteHalf<W>,
-    mut rx: mpsc::Receiver<FrameCommand>,
+    mut control_rx: mpsc::Receiver<FrameCommand>,
+    mut data_rx: mpsc::Receiver<FrameCommand>,
 ) where
     W: AsyncWrite + Unpin,
 {
-    while let Some(cmd) = rx.recv().await {
+    while let Some(cmd) = recv_writer_command(&mut control_rx, &mut data_rx).await {
         if let Err(err) = write_frame(
             &mut write_half,
             cmd.frame_type,
@@ -549,7 +556,7 @@ async fn connect_and_relay_target(
 async fn target_reader_loop(
     stream_id: u64,
     mut target_read: impl AsyncRead + Unpin,
-    writer_tx: mpsc::Sender<FrameCommand>,
+    writer_tx: WriterChannels,
     transferred_counter: Arc<AtomicU64>,
 ) -> Result<u64> {
     let mut transferred = 0u64;
@@ -641,7 +648,7 @@ async fn clear_multiplexed_streams(state: &Arc<ServerTunnelState>) -> usize {
 }
 
 async fn send_writer_command(
-    writer_tx: &mpsc::Sender<FrameCommand>,
+    writer_tx: &WriterChannels,
     cmd: FrameCommand,
     operation: &'static str,
 ) -> Result<()> {
@@ -651,6 +658,7 @@ async fn send_writer_command(
     let started = Instant::now();
 
     writer_tx
+        .sender_for(frame_type)
         .send(cmd)
         .await
         .with_context(|| format!("failed to queue {operation} for multiplexed tunnel"))?;
@@ -667,6 +675,70 @@ async fn send_writer_command(
     }
 
     Ok(())
+}
+
+fn writer_channels(
+    capacity: usize,
+) -> (
+    WriterChannels,
+    mpsc::Receiver<FrameCommand>,
+    mpsc::Receiver<FrameCommand>,
+) {
+    let (control_tx, control_rx) = mpsc::channel(capacity);
+    let (data_tx, data_rx) = mpsc::channel(capacity);
+    (
+        WriterChannels {
+            control_tx,
+            data_tx,
+        },
+        control_rx,
+        data_rx,
+    )
+}
+
+impl WriterChannels {
+    fn sender_for(&self, frame_type: FrameType) -> &mpsc::Sender<FrameCommand> {
+        if is_control_frame(frame_type) {
+            &self.control_tx
+        } else {
+            &self.data_tx
+        }
+    }
+}
+
+fn is_control_frame(frame_type: FrameType) -> bool {
+    !matches!(frame_type, FrameType::TcpData)
+}
+
+async fn recv_writer_command(
+    control_rx: &mut mpsc::Receiver<FrameCommand>,
+    data_rx: &mut mpsc::Receiver<FrameCommand>,
+) -> Option<FrameCommand> {
+    let mut control_open = true;
+    let mut data_open = true;
+
+    loop {
+        if !control_open && !data_open {
+            return None;
+        }
+
+        tokio::select! {
+            biased;
+
+            cmd = control_rx.recv(), if control_open => {
+                if let Some(cmd) = cmd {
+                    return Some(cmd);
+                }
+                control_open = false;
+            }
+            cmd = data_rx.recv(), if data_open => {
+                if let Some(cmd) = cmd {
+                    return Some(cmd);
+                }
+                data_open = false;
+            }
+        }
+    }
 }
 
 fn log_multiplexed_stream_closed(
@@ -1157,7 +1229,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiplexed_dispatch_sends_tcp_data_to_registered_stream() -> Result<()> {
-        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (writer_tx, _control_rx, _data_rx) = writer_channels(1);
         let state = Arc::new(ServerTunnelState {
             streams: Mutex::new(HashMap::new()),
             writer_tx,
@@ -1188,7 +1260,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiplexed_remove_stream_drops_target_input_sender() -> Result<()> {
-        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (writer_tx, _control_rx, _data_rx) = writer_channels(1);
         let state = Arc::new(ServerTunnelState {
             streams: Mutex::new(HashMap::new()),
             writer_tx,
@@ -1206,7 +1278,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiplexed_physical_tunnel_cleanup_drops_all_stream_inputs() -> Result<()> {
-        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (writer_tx, _control_rx, _data_rx) = writer_channels(1);
         let state = Arc::new(ServerTunnelState {
             streams: Mutex::new(HashMap::new()),
             writer_tx,
@@ -1246,16 +1318,17 @@ mod tests {
     async fn multiplexed_writer_loop_serializes_frame_commands() -> Result<()> {
         let (stream, mut peer) = duplex(1024);
         let (_read_half, write_half) = tokio::io::split(stream);
-        let (tx, rx) = mpsc::channel(1);
-        let writer = tokio::spawn(server_tunnel_writer_loop(write_half, rx));
+        let (tx, control_rx, data_rx) = writer_channels(1);
+        let writer = tokio::spawn(server_tunnel_writer_loop(write_half, control_rx, data_rx));
 
-        tx.send(FrameCommand {
-            frame_type: FrameType::TcpData,
-            stream_id: 13,
-            flags: 0,
-            payload: Bytes::from_static(b"hello"),
-        })
-        .await?;
+        tx.data_tx
+            .send(FrameCommand {
+                frame_type: FrameType::TcpData,
+                stream_id: 13,
+                flags: 0,
+                payload: Bytes::from_static(b"hello"),
+            })
+            .await?;
         drop(tx);
 
         let frame = timeout(Duration::from_secs(1), read_frame(&mut peer)).await??;
@@ -1264,6 +1337,34 @@ mod tests {
         assert_eq!(frame.frame_type, FrameType::TcpData);
         assert_eq!(frame.stream_id, 13);
         assert_eq!(frame.payload, Bytes::from_static(b"hello"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiplexed_writer_receive_prioritizes_control_over_data() -> Result<()> {
+        let (tx, mut control_rx, mut data_rx) = writer_channels(2);
+
+        tx.data_tx
+            .send(FrameCommand {
+                frame_type: FrameType::TcpData,
+                stream_id: 13,
+                flags: 0,
+                payload: Bytes::from_static(b"data"),
+            })
+            .await?;
+        tx.control_tx
+            .send(FrameCommand {
+                frame_type: FrameType::TcpClose,
+                stream_id: 13,
+                flags: 0,
+                payload: Bytes::new(),
+            })
+            .await?;
+
+        let frame = recv_writer_command(&mut control_rx, &mut data_rx)
+            .await
+            .expect("writer command");
+        assert_eq!(frame.frame_type, FrameType::TcpClose);
         Ok(())
     }
 

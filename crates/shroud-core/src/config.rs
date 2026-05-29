@@ -105,7 +105,7 @@ impl Default for TunInboundConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundConfig {
     #[serde(default)]
     pub server: String,
@@ -121,6 +121,34 @@ pub struct OutboundConfig {
     pub tls_ca_cert_path: Option<String>,
     #[serde(default)]
     pub multiplex: bool,
+    #[serde(default = "default_multiplex_tunnels")]
+    pub multiplex_tunnels: usize,
+    #[serde(default = "default_max_streams_per_tunnel")]
+    pub max_streams_per_tunnel: usize,
+}
+
+impl Default for OutboundConfig {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            port: 0,
+            path: String::new(),
+            tls: false,
+            tls_server_name: None,
+            tls_ca_cert_path: None,
+            multiplex: false,
+            multiplex_tunnels: default_multiplex_tunnels(),
+            max_streams_per_tunnel: default_max_streams_per_tunnel(),
+        }
+    }
+}
+
+fn default_multiplex_tunnels() -> usize {
+    4
+}
+
+fn default_max_streams_per_tunnel() -> usize {
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -463,6 +491,18 @@ fn validate_outbound_config(errors: &mut Vec<ConfigFieldError>, outbound: &Outbo
             }
         }
     }
+    if outbound.multiplex_tunnels == 0 {
+        errors.push(ConfigFieldError::new(
+            "outbound.multiplex_tunnels",
+            "must be greater than 0",
+        ));
+    }
+    if outbound.max_streams_per_tunnel == 0 {
+        errors.push(ConfigFieldError::new(
+            "outbound.max_streams_per_tunnel",
+            "must be greater than 0",
+        ));
+    }
 }
 
 fn validate_client_auth_config(
@@ -658,6 +698,14 @@ auth:
         assert!(cfg.dns.remote_by_default);
         assert!(cfg.dns.warn_on_ip_targets);
         assert!(!cfg.dns.block_ip_targets);
+    }
+
+    #[test]
+    fn outbound_config_defaults_multiplex_pool_limits() {
+        let cfg: ClientConfig = serde_yaml::from_str(BASE_CLIENT_CONFIG).expect("parse config");
+
+        assert_eq!(cfg.outbound.multiplex_tunnels, 4);
+        assert_eq!(cfg.outbound.max_streams_per_tunnel, 16);
     }
 
     #[test]

@@ -80,11 +80,10 @@ async fn main() -> Result<()> {
 
     let tunnel = tunnel::TunnelClient::new(outbound.clone(), cfg.auth.clone());
     let session = if outbound.multiplex {
-        let tunnel_manager =
-            tunnel_manager::TunnelManager::connect(outbound.clone(), cfg.auth.clone())
-                .await
-                .context("failed to connect persistent tunnel manager")?;
-        session::SessionCore::new_multiplexed(router, tunnel, tunnel_manager, cfg.dns.clone())
+        let tunnel_pool = tunnel_manager::TunnelPool::connect(outbound.clone(), cfg.auth.clone())
+            .await
+            .context("failed to connect persistent tunnel pool")?;
+        session::SessionCore::new_multiplexed(router, tunnel, tunnel_pool, cfg.dns.clone())
     } else {
         session::SessionCore::new(router, tunnel, cfg.dns.clone())
     };
